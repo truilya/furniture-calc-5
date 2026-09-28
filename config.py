@@ -10,11 +10,56 @@
 # Ключ -> человекочитаемое имя (для селектора), значение -> id модели в API.
 # Пополняйте этот словарь по мере появления новых моделей у агрегатора.
 # ---------------------------------------------------------------------------
+# NB: агрегатор регулярно обновляет список моделей — перед релизом
+# сверяйтесь с актуальным перечнем в личном кабинете / документации
+# GPTunneL (https://gptunnel.ru), т.к. id моделей и их доступность
+# могут меняться.
 AVAILABLE_MODELS = {
-    "Claude 3.5 Sonnet": "claude-3-5-sonnet",
+    # --- OpenAI ---
+    "GPT-5": "gpt-5",
+    "GPT-5 mini": "gpt-5-mini",
+    "GPT-4.1": "gpt-4.1",
+    "GPT-4.1 mini": "gpt-4.1-mini",
+    "GPT-4.1 nano": "gpt-4.1-nano",
     "GPT-4o": "gpt-4o",
+    "GPT-4o mini": "gpt-4o-mini",
+    "o3": "o3",
+    "o3-mini": "o3-mini",
+    "o4-mini": "o4-mini",
+
+    # --- Anthropic ---
+    "Claude 3.5 Sonnet": "claude-3-5-sonnet",
+    "Claude 3.5 Haiku": "claude-3-5-haiku",
+    "Claude 3.7 Sonnet": "claude-3-7-sonnet",
+    "Claude 3 Opus": "claude-3-opus",
+    "Claude 4 Sonnet": "claude-4-sonnet",
+    "Claude 4 Opus": "claude-4-opus",
+
+    # --- Google ---
+    "Gemini 1.5 Pro": "gemini-1.5-pro",
+    "Gemini 1.5 Flash": "gemini-1.5-flash",
+    "Gemini 2.0 Flash": "gemini-2.0-flash",
+    "Gemini 2.5 Pro": "gemini-2.5-pro",
+    "Gemini 2.5 Flash": "gemini-2.5-flash",
+
+    # --- DeepSeek ---
     "DeepSeek Chat": "deepseek-chat",
-    "GPT-6-astra": "gpt-6-astra"
+    "DeepSeek Reasoner": "deepseek-reasoner",
+
+    # --- xAI ---
+    "Grok 3": "grok-3",
+    "Grok 3 mini": "grok-3-mini",
+
+    # --- Mistral ---
+    "Mistral Large": "mistral-large",
+    "Mistral Small": "mistral-small",
+
+    # --- Meta (Llama) ---
+    "Llama 3.3 70B": "llama-3.3-70b",
+    "Llama 4 Maverick": "llama-4-maverick",
+
+    # --- Прочее / кастомные модели агрегатора ---
+    "GPT-6-astra": "gpt-6-astra",
 }
 
 DEFAULT_MODEL_LABEL = "GPT-4o"
