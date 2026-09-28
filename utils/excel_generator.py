@@ -149,12 +149,25 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
 
         worksheet = writer.sheets[sheet_name]
 
-        # Автоширина колонок для читаемости
+        # Автоширина колонок для читаемости.
+        # Не используем df[col].astype(str).map(len) напрямую: при наличии
+        # None/NaN в колонке map может получить float('nan'), у которого
+        # нет len(), и упасть с TypeError. Считаем длину вручную,
+        # безопасно приводя каждое значение к строке.
+        def _safe_len(value) -> int:
+            if value is None:
+                return 0
+            try:
+                if pd.isna(value):
+                    return 0
+            except (TypeError, ValueError):
+                pass
+            return len(str(value))
+
         for idx, col in enumerate(df.columns, start=1):
-            max_len = max(
-                df[col].astype(str).map(len).max() if len(df) else 0,
-                len(str(col)),
-            ) + 2
+            column_values = df[col].tolist()
+            max_content_len = max((_safe_len(v) for v in column_values), default=0)
+            max_len = max(max_content_len, len(str(col))) + 2
             worksheet.column_dimensions[worksheet.cell(row=1, column=idx).column_letter].width = min(max_len, 60)
 
         # Объединение ячеек для полей уровня позиции, когда у неё несколько
