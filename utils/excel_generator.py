@@ -12,7 +12,7 @@ import re
 
 import pandas as pd
 
-from config import EXPECTED_COLUMNS, COLUMN_LABELS
+from config import EXPECTED_COLUMNS, COLUMN_LABELS, COLUMN_GROUPS
 
 
 class ResponseParsingError(Exception):
@@ -33,7 +33,10 @@ _ITEM_LEVEL_COLUMNS = [col for col in EXPECTED_COLUMNS if col != "characteristic
 # 'volume' тоже не приходит от ИИ — это вычисляемая колонка: в DataFrame
 # остаётся пустой (None), а формула Excel проставляется только при
 # экспорте в xlsx (см. dataframe_to_excel_bytes).
-_UNFILLED_COLUMNS = {"sketch", "volume"}
+# 'tz_price' / 'sketch_price' — вводятся пользователем вручную в Excel после
+# экспорта; 'tz_sum' / 'sketch_sum' — вычисляются формулой Excel как
+# 'volume' * соответствующая цена (см. dataframe_to_excel_bytes).
+_UNFILLED_COLUMNS = {"sketch", "volume", "tz_price", "tz_sum", "sketch_price", "sketch_sum"}
 
 
 def _extract_json_block(raw_text: str) -> str:
@@ -161,11 +164,39 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
     merge_ranges = df.attrs.get("merge_ranges", [])
     item_start_rows = df.attrs.get("item_start_rows", list(range(len(df))))
 
+    # Обратная карта 'внутреннее имя колонки' -> 'название группы' (для колонок
+    # вроде tz_price/tz_sum, объединяемых общим заголовком 'Вариант 1'/'Вариант 2').
+    col_to_group: dict[str, str] = {
+        col: group_name for group_name, cols in COLUMN_GROUPS.items() for col in cols
+    }
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        # startrow=1 (0-based) сдвигает заголовки колонок на строку 2 и оставляет
+        # строку 1 свободной под общие заголовки групп ('Вариант 1' / 'Вариант 2').
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=1)
 
         worksheet = writer.sheets[sheet_name]
+
+        # Строка 1: для колонок без группы — объединяем с их заголовком в строке 2
+        # по вертикали (чтобы подпись не "провисала" рядом с пустой ячейкой сверху);
+        # для колонок в группе — пишем общее название группы и объединяем по горизонтали
+        # на ширину всех колонок этой группы, сама группа не трогает строку 2.
+        for idx, col in enumerate(df.columns, start=1):
+            if col not in col_to_group:
+                header_cell = worksheet.cell(row=2, column=idx)
+                worksheet.cell(row=1, column=idx).value = header_cell.value
+                header_cell.value = None
+                worksheet.merge_cells(start_row=1, end_row=2, start_column=idx, end_column=idx)
+
+        for group_name, group_cols in COLUMN_GROUPS.items():
+            group_indices = [i for i, col in enumerate(df.columns, start=1) if col in group_cols]
+            if not group_indices:
+                continue
+            start_col, end_col = min(group_indices), max(group_indices)
+            worksheet.cell(row=1, column=start_col).value = group_name
+            if end_col > start_col:
+                worksheet.merge_cells(start_row=1, end_row=1, start_column=start_col, end_column=end_col)
 
         # Автоширина колонок для читаемости.
         # Не используем df[col].astype(str).map(len) напрямую: при наличии
@@ -198,7 +229,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         from openpyxl.styles import Alignment
 
         characteristics_col_idx = list(export_df.columns).index(COLUMN_LABELS["characteristics"]) + 1
-        for row_idx in range(2, worksheet.max_row + 1):
+        for row_idx in range(3, worksheet.max_row + 1):
             worksheet.cell(row=row_idx, column=characteristics_col_idx).alignment = Alignment(
                 wrap_text=True, vertical="top"
             )
@@ -213,37 +244,56 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         height_col = list(export_df.columns).index(COLUMN_LABELS["max_height_mm"]) + 1
         quantity_col = list(export_df.columns).index(COLUMN_LABELS["quantity"]) + 1
         volume_col = list(export_df.columns).index(COLUMN_LABELS["volume"]) + 1
+        tz_price_col = list(export_df.columns).index(COLUMN_LABELS["tz_price"]) + 1
+        tz_sum_col = list(export_df.columns).index(COLUMN_LABELS["tz_sum"]) + 1
+        sketch_price_col = list(export_df.columns).index(COLUMN_LABELS["sketch_price"]) + 1
+        sketch_sum_col = list(export_df.columns).index(COLUMN_LABELS["sketch_sum"]) + 1
 
         width_letter = get_column_letter(width_col)
         depth_letter = get_column_letter(depth_col)
         height_letter = get_column_letter(height_col)
         quantity_letter = get_column_letter(quantity_col)
+        volume_letter = get_column_letter(volume_col)
+        tz_price_letter = get_column_letter(tz_price_col)
+        sketch_price_letter = get_column_letter(sketch_price_col)
 
+        # +3, а не +2: строка 1 теперь занята общими заголовками групп
+        # ('Вариант 1' / 'Вариант 2'), строка 2 — заголовками колонок,
+        # данные (0-based индекс df) начинаются со строки 3.
         for start_row in item_start_rows:
-            excel_row = start_row + 2
+            excel_row = start_row + 3
             w = f"{width_letter}{excel_row}"
             d = f"{depth_letter}{excel_row}"
             h = f"{height_letter}{excel_row}"
             q = f"{quantity_letter}{excel_row}"
+            v = f"{volume_letter}{excel_row}"
+            tz_price_ref = f"{tz_price_letter}{excel_row}"
+            sketch_price_ref = f"{sketch_price_letter}{excel_row}"
             # Excel всегда хранит в xlsx формулы с английскими именами функций
             # (IF/AND/ISNUMBER), независимо от языка интерфейса: локализованные имена
             # (ЕСЛИ/И/ЕЧИСЛО) openpyxl пишет буквально, Excel их не распознаёт
             # и показывает #ИМЯ?. Excel сам отобразит IF/AND/ISNUMBER как
             # ЕСЛИ/И/ЕЧИСЛО при русской локали интерфейса.
-            formula = (
+            volume_formula = (
                 f'=IF(AND(ISNUMBER({w});ISNUMBER({d});ISNUMBER({h});ISNUMBER({q}));'
                 f'({w}/1000)*({d}/1000)*({h}/1000)*{q};"ПУСТО")'
             )
-            worksheet.cell(row=excel_row, column=volume_col).value = formula
+            worksheet.cell(row=excel_row, column=volume_col).value = volume_formula
+
+            # 'Сумма по ТЗ' / 'Сумма по эскизу' = 'Объём' * соответствующая цена.
+            # Проверка ISNUMBER здесь не нужна: пустая ячейка цены при умножении
+            # даёт 0, что для суммы — ожидаемое поведение (а не ошибка).
+            worksheet.cell(row=excel_row, column=tz_sum_col).value = f"={v}*{tz_price_ref}"
+            worksheet.cell(row=excel_row, column=sketch_sum_col).value = f"={v}*{sketch_price_ref}"
 
         # Объединение ячеек для полей уровня позиции, когда у неё несколько
-        # строк-характеристик. +2, т.к. строка 1 — заголовок, а df использует 0-based индекс.
+        # строк-характеристик. +3, т.к. строки 1–2 — заголовки групп/колонок, а df использует 0-based индекс.
         item_level_col_indices = [
             idx for idx, col in enumerate(df.columns, start=1) if col in _ITEM_LEVEL_COLUMNS
         ]
         for start_row, end_row in merge_ranges:
-            excel_start = start_row + 2
-            excel_end = end_row + 2
+            excel_start = start_row + 3
+            excel_end = end_row + 3
             for col_idx in item_level_col_indices:
                 worksheet.merge_cells(
                     start_row=excel_start, end_row=excel_end,

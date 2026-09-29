@@ -115,7 +115,11 @@ DEFAULT_SYSTEM_PROMPT = """\
 # Должны соответствовать полям, описанным в DEFAULT_SYSTEM_PROMPT, кроме двух:
 # 'sketch' — не приходит от ИИ, заполняется пользователем вручную в Excel;
 # 'volume' — не приходит от ИИ, вычисляется формулой Excel из габаритов и
-# количества (см. utils/excel_generator.py).
+# количества (см. utils/excel_generator.py);
+# 'tz_price' / 'sketch_price' — не приходят от ИИ, заполняются пользователем
+# вручную в Excel (цена по ТЗ и цена по эскизу);
+# 'tz_sum' / 'sketch_sum' — не приходят от ИИ, вычисляются формулой Excel как
+# 'volume' * соответствующая цена.
 EXPECTED_COLUMNS = [
     "item_number",
     "name",
@@ -126,7 +130,19 @@ EXPECTED_COLUMNS = [
     "max_height_mm",
     "quantity",
     "volume",
+    "tz_price",
+    "tz_sum",
+    "sketch_price",
+    "sketch_sum",
 ]
+
+# Группировка колонок под общим заголовком верхнего уровня в Excel (двухуровневая
+# шапка). Колонки, не перечисленные ни в одной группе, не имеют общего заголовка
+# (их подпись в COLUMN_LABELS занимает обе строки шапки — см. excel_generator.py).
+COLUMN_GROUPS: dict[str, list[str]] = {
+    "Вариант 1": ["tz_price", "tz_sum"],
+    "Вариант 2": ["sketch_price", "sketch_sum"],
+}
 
 # Русские заголовки колонок для итогового Excel-файла (порядок соответствует
 # EXPECTED_COLUMNS). Внутренние английские имена остаются в DataFrame/коде,
@@ -141,6 +157,10 @@ COLUMN_LABELS: dict[str, str] = {
     "max_height_mm": "Высота",
     "quantity": "Количество",
     "volume": "Объём",
+    "tz_price": "Цена по ТЗ",
+    "tz_sum": "Сумма по ТЗ",
+    "sketch_price": "Цена по эскизу",
+    "sketch_sum": "Сумма по эскизу",
 }
 
 # Таймаут запроса к API (в секундах)
