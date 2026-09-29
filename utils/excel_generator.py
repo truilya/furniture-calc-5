@@ -11,6 +11,7 @@ import json
 import re
 
 import pandas as pd
+from openpyxl.utils import get_column_letter
 
 from config import EXPECTED_COLUMNS, COLUMN_LABELS, COLUMN_GROUPS
 
