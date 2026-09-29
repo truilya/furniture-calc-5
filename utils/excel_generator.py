@@ -37,7 +37,7 @@ _ITEM_LEVEL_COLUMNS = [col for col in EXPECTED_COLUMNS if col != "characteristic
 # 'tz_price' / 'sketch_price' — вводятся пользователем вручную в Excel после
 # экспорта; 'tz_sum' / 'sketch_sum' — вычисляются формулой Excel как
 # 'volume' * соответствующая цена (см. dataframe_to_excel_bytes).
-_UNFILLED_COLUMNS = {"sketch", "volume", "tz_price", "tz_sum", "sketch_price", "sketch_sum"}
+_UNFILLED_COLUMNS = {"sketch", "volume", "tz_price", "tz_sum", "sketch_price", "sketch_sum", "fill_status"}
 
 
 def _extract_json_block(raw_text: str) -> str:
@@ -247,6 +247,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         tz_sum_col = list(export_df.columns).index(COLUMN_LABELS["tz_sum"]) + 1
         sketch_price_col = list(export_df.columns).index(COLUMN_LABELS["sketch_price"]) + 1
         sketch_sum_col = list(export_df.columns).index(COLUMN_LABELS["sketch_sum"]) + 1
+        fill_status_col = list(export_df.columns).index(COLUMN_LABELS["fill_status"]) + 1
 
         width_letter = get_column_letter(width_col)
         depth_letter = get_column_letter(depth_col)
@@ -255,6 +256,8 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         volume_letter = get_column_letter(volume_col)
         tz_price_letter = get_column_letter(tz_price_col)
         sketch_price_letter = get_column_letter(sketch_price_col)
+        tz_sum_letter = get_column_letter(tz_sum_col)
+        sketch_sum_letter = get_column_letter(sketch_sum_col)
 
         # +3, а не +2: строка 1 теперь занята общими заголовками групп
         # ('Вариант 1' / 'Вариант 2'), строка 2 — заголовками колонок,
@@ -275,15 +278,29 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
             # ЕСЛИ/И/ЕЧИСЛО при русской локали интерфейса.
             volume_formula = (
                 f'=IF(AND(ISNUMBER({w});ISNUMBER({d});ISNUMBER({h});ISNUMBER({q}));'
-                f'({w}/1000)*({d}/1000)*({h}/1000)*{q};"ПУСТО")'
+                f'({w}/1000)*({d}/1000)*({h}/1000)*{q};"")'
             )
             worksheet.cell(row=excel_row, column=volume_col).value = volume_formula
 
-            # 'Сумма по ТЗ' / 'Сумма по эскизу' = 'Объём' * соответствующая цена.
-            # Проверка ISNUMBER здесь не нужна: пустая ячейка цены при умножении
-            # даёт 0, что для суммы — ожидаемое поведение (а не ошибка).
-            worksheet.cell(row=excel_row, column=tz_sum_col).value = f"={v}*{tz_price_ref}"
-            worksheet.cell(row=excel_row, column=sketch_sum_col).value = f"={v}*{sketch_price_ref}"
+            # 'Сумма по ТЗ' / 'Сумма по эскизу' = 'Объём' * соответствующая цена,
+            # но только когда оба величины заданы числом — иначе ячейка суммы остаётся
+            # пустой, а не покажет 0 (объём или цена ещё не заполнены).
+            tz_sum_formula = (
+                f'=IF(AND(ISNUMBER({v});ISNUMBER({tz_price_ref}));{v}*{tz_price_ref};"")'
+            )
+            sketch_sum_formula = (
+                f'=IF(AND(ISNUMBER({v});ISNUMBER({sketch_price_ref}));{v}*{sketch_price_ref};"")'
+            )
+            worksheet.cell(row=excel_row, column=tz_sum_col).value = tz_sum_formula
+            worksheet.cell(row=excel_row, column=sketch_sum_col).value = sketch_sum_formula
+
+            # 'Заполнение' = "Заполнено", если обе суммы непусты, иначе "ПУСТО".
+            tz_sum_ref = f"{tz_sum_letter}{excel_row}"
+            sketch_sum_ref = f"{sketch_sum_letter}{excel_row}"
+            fill_status_formula = (
+                f'=IF(AND({tz_sum_ref}="";{sketch_sum_ref}="");"ПУСТО";"Заполнено")'
+            )
+            worksheet.cell(row=excel_row, column=fill_status_col).value = fill_status_formula
 
         # Объединение ячеек для полей уровня позиции, когда у неё несколько
         # строк-характеристик. +3, т.к. строки 1–2 — заголовки групп/колонок, а df использует 0-based индекс.

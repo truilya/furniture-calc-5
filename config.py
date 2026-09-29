@@ -119,7 +119,9 @@ DEFAULT_SYSTEM_PROMPT = """\
 # 'tz_price' / 'sketch_price' — не приходят от ИИ, заполняются пользователем
 # вручную в Excel (цена по ТЗ и цена по эскизу);
 # 'tz_sum' / 'sketch_sum' — не приходят от ИИ, вычисляются формулой Excel как
-# 'volume' * соответствующая цена.
+# 'volume' * соответствующая цена;
+# 'fill_status' — не приходит от ИИ, вычисляется формулой Excel по
+# наличию заполненных 'tz_sum' и 'sketch_sum' ('Заболнено' / 'ПУСТО').
 EXPECTED_COLUMNS = [
     "item_number",
     "name",
@@ -134,6 +136,7 @@ EXPECTED_COLUMNS = [
     "tz_sum",
     "sketch_price",
     "sketch_sum",
+    "fill_status",
 ]
 
 # Группировка колонок под общим заголовком верхнего уровня в Excel (двухуровневая
@@ -161,6 +164,7 @@ COLUMN_LABELS: dict[str, str] = {
     "tz_sum": "Сумма по ТЗ",
     "sketch_price": "Цена по эскизу",
     "sketch_sum": "Сумма по эскизу",
+    "fill_status": "Заполнение",
 }
 
 # Таймаут запроса к API (в секундах)
