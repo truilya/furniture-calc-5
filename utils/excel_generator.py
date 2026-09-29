@@ -217,12 +217,12 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
             column_values = export_df[col].tolist()
             max_content_len = max((_safe_len(v) for v in column_values), default=0)
             max_len = max(max_content_len, len(str(col))) + 2
-            worksheet.column_dimensions[worksheet.cell(row=1, column=idx).column_letter].width = min(max_len, 60)
+            worksheet.column_dimensions[get_column_letter(idx)].width = min(max_len, 60)
 
         # Колонку 'Эскиз' делаем чуть шире, т.к. в неё пользователь будет вручную
         # вставлять изображение — узкая колонка по ширине заголовка для этого мала.
         sketch_col_idx = list(export_df.columns).index(COLUMN_LABELS["sketch"]) + 1
-        worksheet.column_dimensions[worksheet.cell(row=1, column=sketch_col_idx).column_letter].width = 20
+        worksheet.column_dimensions[get_column_letter(sketch_col_idx)].width = 20
 
         # Перенос строк и выравнивание по верхнему краю для колонки характеристик,
         # чтобы многострочный текст был читаемым.
@@ -237,8 +237,6 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         # Формула расчёта объёма (м³) по габаритам и количеству из той же строки.
         # Адреса ячеек берутся по фактическому индексу колонок, а не жёстко — если
         # порядок колонок в config.EXPECTED_COLUMNS изменится, формула перестроится автоматически.
-        from openpyxl.utils import get_column_letter
-
         width_col = list(export_df.columns).index(COLUMN_LABELS["max_width_mm"]) + 1
         depth_col = list(export_df.columns).index(COLUMN_LABELS["max_depth_mm"]) + 1
         height_col = list(export_df.columns).index(COLUMN_LABELS["max_height_mm"]) + 1
