@@ -12,23 +12,15 @@ import re
 
 import pandas as pd
 
+from config import EXPECTED_COLUMNS, COLUMN_LABELS
+
 
 class ResponseParsingError(Exception):
     """Ошибка разбора ответа ИИ в табличный вид."""
 
 
-# Поля соответствуют новой схеме ответа модели (закупочные позиции):
-# item_number, name, characteristics, max_width_mm, max_depth_mm, max_height_mm, quantity
-EXPECTED_COLUMNS = [
-    "item_number",
-    "name",
-    "sketch",
-    "characteristics",
-    "max_width_mm",
-    "max_depth_mm",
-    "max_height_mm",
-    "quantity",
-]
+# EXPECTED_COLUMNS и COLUMN_LABELS вынесены в config.py — это часть контракта
+# данных (соответствует DEFAULT_SYSTEM_PROMPT), а не деталь сериализации в xlsx.
 
 # Колонки, значения которых относятся к позиции целиком (не к конкретной
 # характеристике) — именно их ячейки объединяются в Excel, если у позиции
@@ -39,20 +31,6 @@ _ITEM_LEVEL_COLUMNS = [col for col in EXPECTED_COLUMNS if col != "characteristic
 # она нужна только как место в таблице для последующей ручной вставки
 # изображения/чертежа пользователем прямо в Excel.
 _UNFILLED_COLUMNS = {"sketch"}
-
-# Русские заголовки колонок для итогового Excel-файла (порядок соответствует
-# EXPECTED_COLUMNS). Внутренние английские имена остаются в DataFrame/коде,
-# на русский переводятся только заголовки при экспорте.
-COLUMN_LABELS: dict[str, str] = {
-    "item_number": "№",
-    "name": "Наименование",
-    "sketch": "Эскиз",
-    "characteristics": "Характеристики по ТЗ",
-    "max_width_mm": "Ширина",
-    "max_depth_mm": "Глубина",
-    "max_height_mm": "Высота",
-    "quantity": "Количество",
-}
 
 
 def _extract_json_block(raw_text: str) -> str:
