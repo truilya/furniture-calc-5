@@ -225,8 +225,13 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
             d = f"{depth_letter}{excel_row}"
             h = f"{height_letter}{excel_row}"
             q = f"{quantity_letter}{excel_row}"
+            # Excel всегда хранит в xlsx формулы с английскими именами функций
+            # (IF/AND/ISNUMBER), независимо от языка интерфейса: локализованные имена
+            # (ЕСЛИ/И/ЕЧИСЛО) openpyxl пишет буквально, Excel их не распознаёт
+            # и показывает #ИМЯ?. Excel сам отобразит IF/AND/ISNUMBER как
+            # ЕСЛИ/И/ЕЧИСЛО при русской локали интерфейса.
             formula = (
-                f'=ЕСЛИ(И(ЕЧИСЛО({w});ЕЧИСЛО({d});ЕЧИСЛО({h});ЕЧИСЛО({q}));'
+                f'=IF(AND(ISNUMBER({w});ISNUMBER({d});ISNUMBER({h});ISNUMBER({q}));'
                 f'({w}/1000)*({d}/1000)*({h}/1000)*{q};"ПУСТО")'
             )
             worksheet.cell(row=excel_row, column=volume_col).value = formula
