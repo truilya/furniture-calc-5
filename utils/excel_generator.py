@@ -11,6 +11,7 @@ import json
 import re
 
 import pandas as pd
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from config import EXPECTED_COLUMNS, COLUMN_LABELS, COLUMN_GROUPS
@@ -173,31 +174,49 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # startrow=1 (0-based) сдвигает заголовки колонок на строку 2 и оставляет
-        # строку 1 свободной под общие заголовки групп ('Вариант 1' / 'Вариант 2').
-        export_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=1)
+        # startrow=2 (0-based) сдвигает заголовки колонок на строку 3 и оставляет
+        # строки 1-2 свободными: строка 1 — информационная строка с check_count
+        # (общее количество из ЕИС), строка 2 — общие заголовки групп
+        # ('Вариант 1' / 'Вариант 2').
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
 
         worksheet = writer.sheets[sheet_name]
 
-        # Строка 1: для колонок без группы — объединяем с их заголовком в строке 2
+        # Строка 2: для колонок без группы — объединяем с их заголовком в строке 3
         # по вертикали (чтобы подпись не "провисала" рядом с пустой ячейкой сверху);
         # для колонок в группе — пишем общее название группы и объединяем по горизонтали
-        # на ширину всех колонок этой группы, сама группа не трогает строку 2.
+        # на ширину всех колонок этой группы, сама группа не трогает строку 3.
         for idx, col in enumerate(df.columns, start=1):
             if col not in col_to_group:
-                header_cell = worksheet.cell(row=2, column=idx)
-                worksheet.cell(row=1, column=idx).value = header_cell.value
+                header_cell = worksheet.cell(row=3, column=idx)
+                worksheet.cell(row=2, column=idx).value = header_cell.value
                 header_cell.value = None
-                worksheet.merge_cells(start_row=1, end_row=2, start_column=idx, end_column=idx)
+                worksheet.merge_cells(start_row=2, end_row=3, start_column=idx, end_column=idx)
 
         for group_name, group_cols in COLUMN_GROUPS.items():
             group_indices = [i for i, col in enumerate(df.columns, start=1) if col in group_cols]
             if not group_indices:
                 continue
             start_col, end_col = min(group_indices), max(group_indices)
-            worksheet.cell(row=1, column=start_col).value = group_name
+            worksheet.cell(row=2, column=start_col).value = group_name
             if end_col > start_col:
-                worksheet.merge_cells(start_row=1, end_row=1, start_column=start_col, end_column=end_col)
+                worksheet.merge_cells(start_row=2, end_row=2, start_column=start_col, end_column=end_col)
+
+        # Строка 1: информационная строка с ручным вводом 'check_count' — общее
+        # количество из ЕиС, с которым будет сравниваться сумма 'quantity' в итогах.
+        # Подпись прижата к правой границе и объединяет все колонки до 'quantity'
+        # включительно, сама ячейка check_count расположена ровно над колонкой 'quantity'.
+        quantity_col_idx = list(export_df.columns).index(COLUMN_LABELS["quantity"]) + 1
+        if quantity_col_idx > 1:
+            worksheet.merge_cells(start_row=1, end_row=1, start_column=1, end_column=quantity_col_idx - 1)
+        label_cell = worksheet.cell(row=1, column=1)
+        label_cell.value = "общее количество из ЕИС →"
+        label_cell.alignment = Alignment(horizontal="right")
+        label_cell.font = Font(bold=True)
+        check_count_cell = worksheet.cell(row=1, column=quantity_col_idx)
+        check_count_cell.alignment = Alignment(horizontal="center")
+        check_count_cell.font = Font(bold=True)
+        check_count_ref = f"{get_column_letter(quantity_col_idx)}1"
 
         # Автоширина колонок для читаемости.
         # Не используем df[col].astype(str).map(len) напрямую: при наличии
@@ -227,8 +246,6 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
 
         # Перенос строк и выравнивание по верхнему краю для колонки характеристик,
         # чтобы многострочный текст был читаемым.
-        from openpyxl.styles import Alignment
-
         characteristics_col_idx = list(export_df.columns).index(COLUMN_LABELS["characteristics"]) + 1
         for row_idx in range(3, worksheet.max_row + 1):
             worksheet.cell(row=row_idx, column=characteristics_col_idx).alignment = Alignment(
@@ -315,6 +332,35 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
                     start_row=excel_start, end_row=excel_end,
                     start_column=col_idx, end_column=col_idx,
                 )
+
+        # Итоговая строка под таблицей: сравнивает check_count (строка 1) с суммой
+        # всех 'quantity' в таблице. Подчёркивается сума только по строкам-началам
+        # каждой позиции (item_start_rows), т.к. у объединённых строк 'quantity' заполнено
+        # только в первой строке диапазона, остальные пусты.
+        totals_row = worksheet.max_row + 1
+        if quantity_col_idx > 1:
+            worksheet.merge_cells(
+                start_row=totals_row, end_row=totals_row,
+                start_column=1, end_column=quantity_col_idx - 1,
+            )
+        totals_label_cell = worksheet.cell(row=totals_row, column=1)
+        totals_label_cell.value = "проверка общего количества →"
+        totals_label_cell.alignment = Alignment(horizontal="right")
+        totals_label_cell.font = Font(bold=True)
+
+        quantity_letter = get_column_letter(quantity_col_idx)
+        quantity_sum_terms = "+".join(
+            f"{quantity_letter}{start_row + 3}" for start_row in item_start_rows
+        )
+        totals_result_cell = worksheet.cell(row=totals_row, column=quantity_col_idx)
+        if quantity_sum_terms:
+            totals_result_cell.value = (
+                f'=IF({check_count_ref}=({quantity_sum_terms});"Всё ОК";"Ошибка!")'
+            )
+        else:
+            totals_result_cell.value = f'=IF({check_count_ref}=0;"Всё ОК";"Ошибка!")'
+        totals_result_cell.alignment = Alignment(horizontal="center")
+        totals_result_cell.font = Font(bold=True)
 
     buffer.seek(0)
     return buffer.getvalue()
