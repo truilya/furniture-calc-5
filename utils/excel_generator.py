@@ -22,6 +22,7 @@ class ResponseParsingError(Exception):
 EXPECTED_COLUMNS = [
     "item_number",
     "name",
+    "sketch",
     "characteristics",
     "max_width_mm",
     "max_depth_mm",
@@ -33,6 +34,25 @@ EXPECTED_COLUMNS = [
 # характеристике) — именно их ячейки объединяются в Excel, если у позиции
 # несколько характеристик и, соответственно, несколько строк.
 _ITEM_LEVEL_COLUMNS = [col for col in EXPECTED_COLUMNS if col != "characteristics"]
+
+# Колонка 'sketch' (Эскиз) не приходит от ИИ и не заполняется программно —
+# она нужна только как место в таблице для последующей ручной вставки
+# изображения/чертежа пользователем прямо в Excel.
+_UNFILLED_COLUMNS = {"sketch"}
+
+# Русские заголовки колонок для итогового Excel-файла (порядок соответствует
+# EXPECTED_COLUMNS). Внутренние английские имена остаются в DataFrame/коде,
+# на русский переводятся только заголовки при экспорте.
+COLUMN_LABELS: dict[str, str] = {
+    "item_number": "№",
+    "name": "Наименование",
+    "sketch": "Эскиз",
+    "characteristics": "Характеристики по ТЗ",
+    "max_width_mm": "Ширина",
+    "max_depth_mm": "Глубина",
+    "max_height_mm": "Высота",
+    "quantity": "Количество",
+}
 
 
 def _extract_json_block(raw_text: str) -> str:
@@ -105,7 +125,10 @@ def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
         if not isinstance(item, dict):
             continue
 
-        base_values = {col: item.get(col) for col in _ITEM_LEVEL_COLUMNS}
+        base_values = {
+            col: (None if col in _UNFILLED_COLUMNS else item.get(col))
+            for col in _ITEM_LEVEL_COLUMNS
+        }
         characteristics = _normalize_characteristics(item.get("characteristics"))
 
         if not characteristics:
@@ -143,9 +166,15 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
     ячейки колонок уровня позиции (item_number, name, габариты, quantity)
     объединяются по вертикали в одну — на основе df.attrs['merge_ranges'].
     """
+    # Заголовки переводятся на русский только на выходе, в самом DataFrame
+    # (result_df) и остальном коде продолжают использоваться английские
+    # имена колонок — это упрощает работу с данными (data_editor, фильтры и т.д.).
+    export_df = df.rename(columns=COLUMN_LABELS)
+    merge_ranges = df.attrs.get("merge_ranges", [])
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
         worksheet = writer.sheets[sheet_name]
 
@@ -164,15 +193,29 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
                 pass
             return len(str(value))
 
-        for idx, col in enumerate(df.columns, start=1):
-            column_values = df[col].tolist()
+        for idx, col in enumerate(export_df.columns, start=1):
+            column_values = export_df[col].tolist()
             max_content_len = max((_safe_len(v) for v in column_values), default=0)
             max_len = max(max_content_len, len(str(col))) + 2
             worksheet.column_dimensions[worksheet.cell(row=1, column=idx).column_letter].width = min(max_len, 60)
 
+        # Колонку 'Эскиз' делаем чуть шире, т.к. в неё пользователь будет вручную
+        # вставлять изображение — узкая колонка по ширине заголовка для этого мала.
+        sketch_col_idx = list(export_df.columns).index(COLUMN_LABELS["sketch"]) + 1
+        worksheet.column_dimensions[worksheet.cell(row=1, column=sketch_col_idx).column_letter].width = 20
+
+        # Перенос строк и выравнивание по верхнему краю для колонки характеристик,
+        # чтобы многострочный текст был читаемым.
+        from openpyxl.styles import Alignment
+
+        characteristics_col_idx = list(export_df.columns).index(COLUMN_LABELS["characteristics"]) + 1
+        for row_idx in range(2, worksheet.max_row + 1):
+            worksheet.cell(row=row_idx, column=characteristics_col_idx).alignment = Alignment(
+                wrap_text=True, vertical="top"
+            )
+
         # Объединение ячеек для полей уровня позиции, когда у неё несколько
         # строк-характеристик. +2, т.к. строка 1 — заголовок, а df использует 0-based индекс.
-        merge_ranges = df.attrs.get("merge_ranges", [])
         item_level_col_indices = [
             idx for idx, col in enumerate(df.columns, start=1) if col in _ITEM_LEVEL_COLUMNS
         ]
