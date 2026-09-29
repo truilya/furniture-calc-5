@@ -30,7 +30,10 @@ _ITEM_LEVEL_COLUMNS = [col for col in EXPECTED_COLUMNS if col != "characteristic
 # Колонка 'sketch' (Эскиз) не приходит от ИИ и не заполняется программно —
 # она нужна только как место в таблице для последующей ручной вставки
 # изображения/чертежа пользователем прямо в Excel.
-_UNFILLED_COLUMNS = {"sketch"}
+# 'volume' тоже не приходит от ИИ — это вычисляемая колонка: в DataFrame
+# остаётся пустой (None), а формула Excel проставляется только при
+# экспорте в xlsx (см. dataframe_to_excel_bytes).
+_UNFILLED_COLUMNS = {"sketch", "volume"}
 
 
 def _extract_json_block(raw_text: str) -> str:
@@ -98,6 +101,7 @@ def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
 
     rows: list[dict] = []
     merge_ranges: list[tuple[int, int]] = []  # (первая, последняя) строка одной позиции, 0-based
+    item_start_rows: list[int] = []  # 0-based индексы первых строк каждой позиции (для формулы объёма)
 
     for item in items:
         if not isinstance(item, dict):
@@ -111,10 +115,12 @@ def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
 
         if not characteristics:
             # Пустой список характеристик -> null (пустая ячейка) в одной строке.
+            item_start_rows.append(len(rows))
             rows.append({**base_values, "characteristics": None})
             continue
 
         start_row = len(rows)
+        item_start_rows.append(start_row)
         for idx, characteristic in enumerate(characteristics):
             if idx == 0:
                 rows.append({**base_values, "characteristics": characteristic})
@@ -131,6 +137,10 @@ def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
     # Диапазоны строк для объединения ячеек сохраняем в атрибутах DataFrame,
     # чтобы dataframe_to_excel_bytes мог их использовать без пересчёта.
     df.attrs["merge_ranges"] = merge_ranges
+    # Строки-начала каждой позиции — именно в них dataframe_to_excel_bytes проставит
+    # формулу расчёта объёма (для продолжений той же позиции формула не нужна,
+    # т.к. ячейки будут объединены).
+    df.attrs["item_start_rows"] = item_start_rows
 
     return df
 
@@ -149,6 +159,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
     # имена колонок — это упрощает работу с данными (data_editor, фильтры и т.д.).
     export_df = df.rename(columns=COLUMN_LABELS)
     merge_ranges = df.attrs.get("merge_ranges", [])
+    item_start_rows = df.attrs.get("item_start_rows", list(range(len(df))))
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -191,6 +202,34 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
             worksheet.cell(row=row_idx, column=characteristics_col_idx).alignment = Alignment(
                 wrap_text=True, vertical="top"
             )
+
+        # Формула расчёта объёма (м³) по габаритам и количеству из той же строки.
+        # Адреса ячеек берутся по фактическому индексу колонок, а не жёстко — если
+        # порядок колонок в config.EXPECTED_COLUMNS изменится, формула перестроится автоматически.
+        from openpyxl.utils import get_column_letter
+
+        width_col = list(export_df.columns).index(COLUMN_LABELS["max_width_mm"]) + 1
+        depth_col = list(export_df.columns).index(COLUMN_LABELS["max_depth_mm"]) + 1
+        height_col = list(export_df.columns).index(COLUMN_LABELS["max_height_mm"]) + 1
+        quantity_col = list(export_df.columns).index(COLUMN_LABELS["quantity"]) + 1
+        volume_col = list(export_df.columns).index(COLUMN_LABELS["volume"]) + 1
+
+        width_letter = get_column_letter(width_col)
+        depth_letter = get_column_letter(depth_col)
+        height_letter = get_column_letter(height_col)
+        quantity_letter = get_column_letter(quantity_col)
+
+        for start_row in item_start_rows:
+            excel_row = start_row + 2
+            w = f"{width_letter}{excel_row}"
+            d = f"{depth_letter}{excel_row}"
+            h = f"{height_letter}{excel_row}"
+            q = f"{quantity_letter}{excel_row}"
+            formula = (
+                f'=ЕСЛИ(И(ЕЧИСЛО({w});ЕЧИСЛО({d});ЕЧИСЛО({h});ЕЧИСЛО({q}));'
+                f'({w}/1000)*({d}/1000)*({h}/1000)*{q};"ПУСТО")'
+            )
+            worksheet.cell(row=excel_row, column=volume_col).value = formula
 
         # Объединение ячеек для полей уровня позиции, когда у неё несколько
         # строк-характеристик. +2, т.к. строка 1 — заголовок, а df использует 0-based индекс.
