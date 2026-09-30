@@ -247,7 +247,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         # Перенос строк и выравнивание по верхнему краю для колонки характеристик,
         # чтобы многострочный текст был читаемым.
         characteristics_col_idx = list(export_df.columns).index(COLUMN_LABELS["characteristics"]) + 1
-        for row_idx in range(3, worksheet.max_row + 1):
+        for row_idx in range(4, worksheet.max_row + 1):
             worksheet.cell(row=row_idx, column=characteristics_col_idx).alignment = Alignment(
                 wrap_text=True, vertical="top"
             )
@@ -276,11 +276,12 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
         tz_sum_letter = get_column_letter(tz_sum_col)
         sketch_sum_letter = get_column_letter(sketch_sum_col)
 
-        # +3, а не +2: строка 1 теперь занята общими заголовками групп
-        # ('Вариант 1' / 'Вариант 2'), строка 2 — заголовками колонок,
-        # данные (0-based индекс df) начинаются со строки 3.
+        # +4, а не +3: строка 1 занята информационной строкой check_count,
+        # строка 2 — общими заголовками групп ('Вариант 1' / 'Вариант 2'),
+        # строка 3 — заголовками колонок (см. startrow=2 в to_excel выше),
+        # данные (0-based индекс df) начинаются со строки 4.
         for start_row in item_start_rows:
-            excel_row = start_row + 3
+            excel_row = start_row + 4
             w = f"{width_letter}{excel_row}"
             d = f"{depth_letter}{excel_row}"
             h = f"{height_letter}{excel_row}"
@@ -320,13 +321,13 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
             worksheet.cell(row=excel_row, column=fill_status_col).value = fill_status_formula
 
         # Объединение ячеек для полей уровня позиции, когда у неё несколько
-        # строк-характеристик. +3, т.к. строки 1–2 — заголовки групп/колонок, а df использует 0-based индекс.
+        # строк-характеристик. +4, т.к. строки 1-3 — заголовки check_count/групп/колонок, а df использует 0-based индекс.
         item_level_col_indices = [
             idx for idx, col in enumerate(df.columns, start=1) if col in _ITEM_LEVEL_COLUMNS
         ]
         for start_row, end_row in merge_ranges:
-            excel_start = start_row + 3
-            excel_end = end_row + 3
+            excel_start = start_row + 4
+            excel_end = end_row + 4
             for col_idx in item_level_col_indices:
                 worksheet.merge_cells(
                     start_row=excel_start, end_row=excel_end,
@@ -350,7 +351,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции
 
         quantity_letter = get_column_letter(quantity_col_idx)
         quantity_sum_terms = "+".join(
-            f"{quantity_letter}{start_row + 3}" for start_row in item_start_rows
+            f"{quantity_letter}{start_row + 4}" for start_row in item_start_rows
         )
         totals_result_cell = worksheet.cell(row=totals_row, column=quantity_col_idx)
         if quantity_sum_terms:
