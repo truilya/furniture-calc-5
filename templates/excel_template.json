@@ -1,0 +1,55 @@
+{
+  "sheet_name": "Позиции закупки",
+  "top_rows": [
+    {
+      "id": "check_count",
+      "label": "общее количество из ЕИС →",
+      "input_column": "quantity"
+    }
+  ],
+  "columns": [
+    {"key": "item_number", "label": "№", "source": "ai"},
+    {"key": "name", "label": "Наименование", "source": "ai", "wrap": true, "width": 30},
+    {"key": "sketch", "label": "Эскиз", "source": "manual", "width": 20},
+    {"key": "characteristics", "label": "Характеристики по ТЗ", "source": "ai", "type": "list", "item_level": false, "wrap": true, "width": 50},
+    {"key": "max_width_mm", "label": "Ширина", "source": "ai"},
+    {"key": "max_depth_mm", "label": "Глубина", "source": "ai"},
+    {"key": "max_height_mm", "label": "Высота", "source": "ai"},
+    {"key": "quantity", "label": "Количество", "source": "ai"},
+    {
+      "key": "volume",
+      "label": "Объём",
+      "source": "formula",
+      "formula": "=IF(AND(ISNUMBER({max_width_mm}),ISNUMBER({max_depth_mm}),ISNUMBER({max_height_mm}),ISNUMBER({quantity})),({max_width_mm}/1000)*({max_depth_mm}/1000)*({max_height_mm}/1000)*{quantity},\"\")"
+    },
+    {"key": "tz_price", "label": "Цена по ТЗ", "source": "manual", "group": "Вариант 1"},
+    {
+      "key": "tz_sum",
+      "label": "Сумма по ТЗ",
+      "source": "formula",
+      "group": "Вариант 1",
+      "formula": "=IF(AND(ISNUMBER({volume}),ISNUMBER({tz_price})),{volume}*{tz_price},\"\")"
+    },
+    {"key": "sketch_price", "label": "Цена по эскизу", "source": "manual", "group": "Вариант 2"},
+    {
+      "key": "sketch_sum",
+      "label": "Сумма по эскизу",
+      "source": "formula",
+      "group": "Вариант 2",
+      "formula": "=IF(AND(ISNUMBER({volume}),ISNUMBER({sketch_price})),{volume}*{sketch_price},\"\")"
+    },
+    {
+      "key": "fill_status",
+      "label": "Заполнение",
+      "source": "formula",
+      "formula": "=IF(AND({tz_sum}=\"\",{sketch_sum}=\"\"),\"ПУСТО\",\"Заполнено\")"
+    }
+  ],
+  "footer_rows": [
+    {
+      "label": "проверка общего количества →",
+      "value_column": "quantity",
+      "formula": "=IF({@check_count}=SUM({quantity:range}),\"Всё ОК\",\"Ошибка!\")"
+    }
+  ]
+}

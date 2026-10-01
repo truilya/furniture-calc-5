@@ -4,6 +4,8 @@
 Здесь удобно расширять список моделей, дефолтный системный промпт
 и прочие константы по мере роста проекта (авторизация, лимиты и т.п.)
 """
+import json
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Список моделей, доступных через агрегатор GPTunneL.
@@ -106,66 +108,38 @@ DEFAULT_SYSTEM_PROMPT = """\
 """
 
 # ---------------------------------------------------------------------------
-# Схема табличных данных (позиции закупки), извлекаемых из ответа ИИ.
-# Единая точка правды: используется в utils/excel_generator.py при разборе
-# JSON-ответа модели и при генерации итогового xlsx-файла.
+# Шаблон итоговой Excel-таблицы.
+# Единая точка правды о колонках: порядок, заголовки, группы, формулы,
+# служебные строки сверху/снизу описаны в templates/excel_template.json.
+# utils/excel_generator.py не содержит имён конкретных полей — чтобы
+# добавить/изменить колонку, правьте JSON (и DEFAULT_SYSTEM_PROMPT, если
+# поле приходит от ИИ). Формат шаблона описан в ARCHITECTURE.md, §4.4.
 # ---------------------------------------------------------------------------
+EXCEL_TEMPLATE_PATH = Path(__file__).parent / "templates" / "excel_template.json"
 
-# Внутренние (английские) имена колонок, в порядке отображения в таблице.
-# Должны соответствовать полям, описанным в DEFAULT_SYSTEM_PROMPT, кроме двух:
-# 'sketch' — не приходит от ИИ, заполняется пользователем вручную в Excel;
-# 'volume' — не приходит от ИИ, вычисляется формулой Excel из габаритов и
-# количества (см. utils/excel_generator.py);
-# 'tz_price' / 'sketch_price' — не приходят от ИИ, заполняются пользователем
-# вручную в Excel (цена по ТЗ и цена по эскизу);
-# 'tz_sum' / 'sketch_sum' — не приходят от ИИ, вычисляются формулой Excel как
-# 'volume' * соответствующая цена;
-# 'fill_status' — не приходит от ИИ, вычисляется формулой Excel по
-# наличию заполненных 'tz_sum' и 'sketch_sum' ('Заболнено' / 'ПУСТО').
-EXPECTED_COLUMNS = [
-    "item_number",
-    "name",
-    "sketch",
-    "characteristics",
-    "max_width_mm",
-    "max_depth_mm",
-    "max_height_mm",
-    "quantity",
-    "volume",
-    "tz_price",
-    "tz_sum",
-    "sketch_price",
-    "sketch_sum",
-    "fill_status",
-]
 
-# Группировка колонок под общим заголовком верхнего уровня в Excel (двухуровневая
-# шапка). Колонки, не перечисленные ни в одной группе, не имеют общего заголовка
-# (их подпись в COLUMN_LABELS занимает обе строки шапки — см. excel_generator.py).
-COLUMN_GROUPS: dict[str, list[str]] = {
-    "Вариант 1": ["tz_price", "tz_sum"],
-    "Вариант 2": ["sketch_price", "sketch_sum"],
-}
+def load_excel_template(path: Path = EXCEL_TEMPLATE_PATH) -> dict:
+    """Читает JSON-шаблон Excel с диска."""
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
-# Русские заголовки колонок для итогового Excel-файла (порядок соответствует
-# EXPECTED_COLUMNS). Внутренние английские имена остаются в DataFrame/коде,
-# на русский переводятся только заголовки при экспорте.
+
+EXCEL_TEMPLATE: dict = load_excel_template()
+
+# Производные константы — для остального кода, который их импортирует.
+# Внутренние (английские) имена колонок в порядке отображения в таблице.
+EXPECTED_COLUMNS: list[str] = [col["key"] for col in EXCEL_TEMPLATE["columns"]]
+
+# Русские заголовки колонок: внутреннее имя -> заголовок в Excel.
 COLUMN_LABELS: dict[str, str] = {
-    "item_number": "№",
-    "name": "Наименование",
-    "sketch": "Эскиз",
-    "characteristics": "Характеристики по ТЗ",
-    "max_width_mm": "Ширина",
-    "max_depth_mm": "Глубина",
-    "max_height_mm": "Высота",
-    "quantity": "Количество",
-    "volume": "Объём",
-    "tz_price": "Цена по ТЗ",
-    "tz_sum": "Сумма по ТЗ",
-    "sketch_price": "Цена по эскизу",
-    "sketch_sum": "Сумма по эскизу",
-    "fill_status": "Заполнение",
+    col["key"]: col["label"] for col in EXCEL_TEMPLATE["columns"]
 }
+
+# Группы колонок под общим заголовком: название группы -> список ключей.
+COLUMN_GROUPS: dict[str, list[str]] = {}
+for _col in EXCEL_TEMPLATE["columns"]:
+    if _col.get("group"):
+        COLUMN_GROUPS.setdefault(_col["group"], []).append(_col["key"])
 
 # Таймаут запроса к API (в секундах)
 REQUEST_TIMEOUT = 120

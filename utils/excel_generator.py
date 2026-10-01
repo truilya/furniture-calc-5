@@ -1,8 +1,43 @@
 # utils/excel_generator.py
 """
-Парсинг структурированного (JSON) ответа ИИ в pandas.DataFrame
-и генерация xlsx-файла. DataFrame — единый источник правды:
-он же используется для st.data_editor в будущем.
+Разбор JSON-ответа ИИ в pandas.DataFrame и генерация xlsx по JSON-шаблону
+(templates/excel_template.json, загружается в config.EXCEL_TEMPLATE).
+
+Код не знает конкретных полей: колонки, заголовки, группы, формулы,
+верхние и нижние служебные строки берутся из шаблона. Чтобы добавить
+или изменить колонку, правьте шаблон (и промпт, если поле приходит от ИИ).
+
+Формат шаблона
+--------------
+columns[] — список колонок слева направо:
+    key           — внутреннее имя (ключ в JSON ответа ИИ и колонка DataFrame)
+    label         — заголовок в Excel
+    source        — "ai" (значение из ответа модели),
+                    "manual" (пустая, заполняет пользователь),
+                    "formula" (формула Excel, поле "formula")
+    group         — (необяз.) общий заголовок над соседними колонками
+    type          — (необяз.) "list": значение — массив, каждый элемент
+                    выводится в отдельной строке
+    item_level    — (необяз., по умолчанию true) ячейки колонки объединяются
+                    по вертикали, если у позиции несколько строк
+    wrap          — (необяз.) перенос по словам
+    width         — (необяз.) ширина колонки; иначе подбирается автоматически
+    number_format — (необяз.) числовой формат Excel
+    formula       — для source="formula"
+
+top_rows[]    — строки НАД шапкой: id, label, input_column
+                (под подписью объединяются ячейки до input_column,
+                сама ячейка ввода остаётся пустой)
+footer_rows[] — строки ПОД таблицей: label, value_column, formula
+
+Плейсхолдеры в формулах:
+    {key}        — ячейка колонки key в текущей строке позиции
+    {key:range}  — диапазон данных колонки key (первая—последняя строка)
+    {@id}        — абсолютный адрес ячейки ввода из top_rows
+
+Формулы пишутся с английскими именами функций и запятой между
+аргументами: так они хранятся в xlsx, Excel сам покажет их в локали
+пользователя (ЕСЛИ, И, ЕЧИСЛО, ;).
 """
 from __future__ import annotations
 
@@ -11,82 +46,206 @@ import json
 import re
 
 import pandas as pd
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from config import EXPECTED_COLUMNS, COLUMN_LABELS, COLUMN_GROUPS
+from config import EXCEL_TEMPLATE
 
 
 class ResponseParsingError(Exception):
     """Ошибка разбора ответа ИИ в табличный вид."""
 
 
-# EXPECTED_COLUMNS и COLUMN_LABELS вынесены в config.py — это часть контракта
-# данных (соответствует DEFAULT_SYSTEM_PROMPT), а не деталь сериализации в xlsx.
+class TemplateError(Exception):
+    """Ошибка в JSON-шаблоне Excel."""
 
-# Колонки, значения которых относятся к позиции целиком (не к конкретной
-# характеристике) — именно их ячейки объединяются в Excel, если у позиции
-# несколько характеристик и, соответственно, несколько строк.
-_ITEM_LEVEL_COLUMNS = [col for col in EXPECTED_COLUMNS if col != "characteristics"]
 
-# Колонка 'sketch' (Эскиз) не приходит от ИИ и не заполняется программно —
-# она нужна только как место в таблице для последующей ручной вставки
-# изображения/чертежа пользователем прямо в Excel.
-# 'volume' тоже не приходит от ИИ — это вычисляемая колонка: в DataFrame
-# остаётся пустой (None), а формула Excel проставляется только при
-# экспорте в xlsx (см. dataframe_to_excel_bytes).
-# 'tz_price' / 'sketch_price' — вводятся пользователем вручную в Excel после
-# экспорта; 'tz_sum' / 'sketch_sum' — вычисляются формулой Excel как
-# 'volume' * соответствующая цена (см. dataframe_to_excel_bytes).
-_UNFILLED_COLUMNS = {"sketch", "volume", "tz_price", "tz_sum", "sketch_price", "sketch_sum", "fill_status"}
+_PLACEHOLDER_RE = re.compile(r"\{(@?)([A-Za-z0-9_]+)(?::(range))?\}")
+_VALID_SOURCES = {"ai", "manual", "formula"}
+
+
+# ---------------------------------------------------------------------------
+# Работа с шаблоном
+# ---------------------------------------------------------------------------
+
+def _is_list_column(col: dict) -> bool:
+    return col.get("type") == "list"
+
+
+def _is_item_level(col: dict) -> bool:
+    return col.get("item_level", True)
+
+
+def validate_template(template: dict) -> None:
+    """Проверяет шаблон и бросает TemplateError с понятным текстом."""
+    columns = template.get("columns")
+    if not isinstance(columns, list) or not columns:
+        raise TemplateError("В шаблоне нет непустого списка 'columns'.")
+
+    keys: list[str] = []
+    for col in columns:
+        key = col.get("key")
+        if not key:
+            raise TemplateError(f"У колонки нет 'key': {col}")
+        if key in keys:
+            raise TemplateError(f"Ключ колонки повторяется: {key}")
+        keys.append(key)
+        if "label" not in col:
+            raise TemplateError(f"У колонки '{key}' нет 'label'.")
+        source = col.get("source")
+        if source not in _VALID_SOURCES:
+            raise TemplateError(
+                f"У колонки '{key}' неверный source: {source!r} "
+                f"(допустимо: {sorted(_VALID_SOURCES)})."
+            )
+        if source == "formula" and not col.get("formula"):
+            raise TemplateError(f"У формульной колонки '{key}' нет 'formula'.")
+
+    top_ids = []
+    for row in template.get("top_rows", []):
+        if row.get("input_column") not in keys:
+            raise TemplateError(f"top_rows: неизвестная input_column в {row}")
+        if not row.get("id"):
+            raise TemplateError(f"top_rows: у строки нет 'id': {row}")
+        top_ids.append(row["id"])
+
+    for row in template.get("footer_rows", []):
+        if row.get("value_column") not in keys:
+            raise TemplateError(f"footer_rows: неизвестная value_column в {row}")
+        if not row.get("formula"):
+            raise TemplateError(f"footer_rows: у строки нет 'formula': {row}")
+
+    # Проверяем, что все плейсхолдеры формул ссылаются на существующее.
+    formulas = [c["formula"] for c in columns if c.get("source") == "formula"]
+    formulas += [r["formula"] for r in template.get("footer_rows", [])]
+    for formula in formulas:
+        for at, name, _range in _PLACEHOLDER_RE.findall(formula):
+            if at and name not in top_ids:
+                raise TemplateError(f"В формуле неизвестная ячейка ввода {{@{name}}}: {formula}")
+            if not at and name not in keys:
+                raise TemplateError(f"В формуле неизвестная колонка {{{name}}}: {formula}")
+
+
+def _render_formula(
+    formula: str,
+    col_letters: dict[str, str],
+    top_cells: dict[str, str],
+    row: int | None,
+    first_row: int,
+    last_row: int,
+) -> str:
+    """Подставляет адреса ячеек вместо плейсхолдеров."""
+
+    def repl(match: re.Match) -> str:
+        at, name, range_flag = match.group(1), match.group(2), match.group(3)
+        if at:
+            return top_cells[name]
+        letter = col_letters[name]
+        if range_flag:
+            return f"{letter}{first_row}:{letter}{last_row}"
+        if row is None:
+            raise TemplateError(
+                f"Плейсхолдер {{{name}}} без ':range' нельзя использовать в строке итогов."
+            )
+        return f"{letter}{row}"
+
+    return _PLACEHOLDER_RE.sub(repl, formula)
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции разбора
+# ---------------------------------------------------------------------------
+
+def _is_empty(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _extract_json_block(raw_text: str) -> str:
-    """
-    Модели иногда оборачивают JSON в ```json ... ``` несмотря на промпт.
-    Эта функция отделяет чистый JSON от возможного markdown-обрамления.
-    """
+    """Вырезает JSON-объект из ответа, даже если он обёрнут в ```json ... ```."""
     match = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
     if not match:
         raise ResponseParsingError("В ответе модели не найден JSON-объект.")
     return match.group(0)
 
 
-def _normalize_characteristics(raw_characteristics) -> list[str]:
-    """
-    Приводит поле 'characteristics' к списку строк.
-    Модель обязана возвращать список, но на случай отклонения от промпта
-    (например, строка вместо списка) — подстраховываемся, а не падаем.
-    """
-    if raw_characteristics is None:
+def _normalize_list(raw_value) -> list[str]:
+    """Приводит значение list-колонки к списку непустых строк."""
+    if raw_value is None:
         return []
-    if isinstance(raw_characteristics, list):
-        return [str(c) for c in raw_characteristics if c is not None and str(c).strip() != ""]
-    text = str(raw_characteristics).strip()
+    if isinstance(raw_value, list):
+        return [str(v) for v in raw_value if v is not None and str(v).strip() != ""]
+    text = str(raw_value).strip()
     return [text] if text else []
 
 
-def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
+def _find_item_ranges(df: pd.DataFrame, columns: list[dict]) -> list[tuple[int, int]]:
     """
-    Преобразует сырой ответ ИИ в pandas.DataFrame с фиксированным набором колонок.
+    Определяет позиции по самому DataFrame (0-based, включительно).
+    Строка — продолжение предыдущей позиции, если в ней нет ни одного
+    значения скалярных ai-колонок, но есть значение list-колонки.
+    Работает и после ручного редактирования в st.data_editor.
+    """
+    scalar_keys = [c["key"] for c in columns if c["source"] == "ai" and not _is_list_column(c)]
+    list_keys = [c["key"] for c in columns if _is_list_column(c)]
+
+    starts: list[int] = []
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        has_scalar = any(not _is_empty(row[k]) for k in scalar_keys)
+        has_list = any(not _is_empty(row[k]) for k in list_keys)
+        if idx == 0 or has_scalar or not has_list:
+            starts.append(idx)
+
+    ranges = []
+    for i, start in enumerate(starts):
+        end = (starts[i + 1] - 1) if i + 1 < len(starts) else len(df) - 1
+        ranges.append((start, end))
+    return ranges
+
+
+def _to_excel_value(value):
+    """Приводит значение ячейки DataFrame к типу, понятному openpyxl."""
+    if _is_empty(value):
+        return None
+    if hasattr(value, "item"):  # numpy-скаляры
+        value = value.item()
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Ответ ИИ -> DataFrame
+# ---------------------------------------------------------------------------
+
+def parse_ai_response_to_df(raw_response: str, template: dict | None = None) -> pd.DataFrame:
+    """
+    Преобразует сырой ответ ИИ в DataFrame с колонками из шаблона.
 
     Ожидаемые форматы ответа:
       - {"items": [...]}          — успешный разбор
       - {"error": "текст ошибки"} — модель не смогла прочитать файл
 
-    Каждая характеристика позиции выносится в отдельную строку таблицы.
-    Если у позиции несколько характеристик, поля уровня позиции
-    (item_number, name, габариты, quantity) физически дублируются в
-    DataFrame только в первой строке, а для последующих строк того же
-    объекта — оставляются пустыми (None), т.к. при рендере в Excel такие
-    ячейки объединяются в одну (см. dataframe_to_excel_bytes).
+    Колонки type="list" раскладываются по строкам (элемент списка — строка).
+    Значения остальных колонок записываются только в первую строку позиции.
+    Колонки не от ИИ (manual/formula) остаются пустыми.
 
     Raises:
-        ResponseParsingError: при невалидном JSON, отсутствии 'items'
-            или явной ошибке модели ("error").
+        ResponseParsingError: невалидный JSON, нет 'items' или ошибка модели.
     """
-    json_block = _extract_json_block(raw_response)
+    template = template or EXCEL_TEMPLATE
+    columns = template["columns"]
+    keys = [c["key"] for c in columns]
 
+    json_block = _extract_json_block(raw_response)
     try:
         data = json.loads(json_block)
     except json.JSONDecodeError as exc:
@@ -95,7 +254,6 @@ def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
     if not isinstance(data, dict):
         raise ResponseParsingError("Ответ модели должен быть JSON-объектом.")
 
-    # Модель явно сообщила, что не смогла разобрать файл ТЗ.
     if "error" in data:
         error_text = data.get("error") or "Модель сообщила об ошибке анализа файла."
         raise ResponseParsingError(str(error_text))
@@ -105,263 +263,173 @@ def parse_ai_response_to_df(raw_response: str) -> pd.DataFrame:
         raise ResponseParsingError("В JSON отсутствует непустой список 'items'.")
 
     rows: list[dict] = []
-    merge_ranges: list[tuple[int, int]] = []  # (первая, последняя) строка одной позиции, 0-based
-    item_start_rows: list[int] = []  # 0-based индексы первых строк каждой позиции (для формулы объёма)
-
     for item in items:
         if not isinstance(item, dict):
             continue
 
-        base_values = {
-            col: (None if col in _UNFILLED_COLUMNS else item.get(col))
-            for col in _ITEM_LEVEL_COLUMNS
-        }
-        characteristics = _normalize_characteristics(item.get("characteristics"))
+        lists = {c["key"]: _normalize_list(item.get(c["key"])) for c in columns if _is_list_column(c)}
+        row_count = max([len(v) for v in lists.values()] + [1])
 
-        if not characteristics:
-            # Пустой список характеристик -> null (пустая ячейка) в одной строке.
-            item_start_rows.append(len(rows))
-            rows.append({**base_values, "characteristics": None})
+        for i in range(row_count):
+            row: dict = {}
+            for col in columns:
+                key = col["key"]
+                if _is_list_column(col):
+                    row[key] = lists[key][i] if i < len(lists[key]) else None
+                elif i == 0 and col["source"] == "ai":
+                    row[key] = item.get(key)
+                else:
+                    row[key] = None
+            rows.append(row)
+
+    return pd.DataFrame(rows, columns=keys)
+
+
+# ---------------------------------------------------------------------------
+# DataFrame -> xlsx
+# ---------------------------------------------------------------------------
+
+def _merge_item_cells(ws, columns: list[dict], ranges: list[tuple[int, int]], data_start: int) -> None:
+    """Объединяет по вертикали ячейки item_level-колонок у позиций с несколькими строками."""
+    item_level_idx = [i for i, c in enumerate(columns, start=1) if _is_item_level(c)]
+    for start, end in ranges:
+        if end <= start:
             continue
+        for col_idx in item_level_idx:
+            ws.merge_cells(
+                start_row=data_start + start, end_row=data_start + end,
+                start_column=col_idx, end_column=col_idx,
+            )
 
-        start_row = len(rows)
-        item_start_rows.append(start_row)
-        for idx, characteristic in enumerate(characteristics):
-            if idx == 0:
-                rows.append({**base_values, "characteristics": characteristic})
+
+def _write_header(ws, columns: list[dict], header_row: int) -> None:
+    """Двухстрочная шапка: группы объединяются по горизонтали, остальные — по вертикали."""
+    header_font = Font(bold=True)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    idx = 1
+    while idx <= len(columns):
+        col = columns[idx - 1]
+        group = col.get("group")
+        if group:
+            end = idx
+            while end + 1 <= len(columns) and columns[end].get("group") == group:
+                end += 1
+            ws.cell(row=header_row, column=idx).value = group
+            if end > idx:
+                ws.merge_cells(start_row=header_row, end_row=header_row, start_column=idx, end_column=end)
+            for j in range(idx, end + 1):
+                ws.cell(row=header_row + 1, column=j).value = columns[j - 1]["label"]
+            idx = end + 1
+        else:
+            ws.cell(row=header_row, column=idx).value = col["label"]
+            ws.merge_cells(start_row=header_row, end_row=header_row + 1, start_column=idx, end_column=idx)
+            idx += 1
+
+    for r in (header_row, header_row + 1):
+        for c in range(1, len(columns) + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.font = header_font
+            cell.alignment = header_align
+
+
+def _write_label_row(ws, row: int, label: str, value_col_idx: int) -> None:
+    """Подпись, прижатая вправо и объединённая до колонки значения."""
+    if value_col_idx > 1:
+        ws.merge_cells(start_row=row, end_row=row, start_column=1, end_column=value_col_idx - 1)
+    label_cell = ws.cell(row=row, column=1)
+    label_cell.value = label
+    label_cell.alignment = Alignment(horizontal="right")
+    label_cell.font = Font(bold=True)
+    value_cell = ws.cell(row=row, column=value_col_idx)
+    value_cell.alignment = Alignment(horizontal="center")
+    value_cell.font = Font(bold=True)
+
+
+def dataframe_to_excel_bytes(
+    df: pd.DataFrame,
+    sheet_name: str | None = None,
+    template: dict | None = None,
+) -> bytes:
+    """
+    Сериализует DataFrame в xlsx по шаблону и возвращает байты
+    (для st.download_button).
+    """
+    template = template or EXCEL_TEMPLATE
+    validate_template(template)
+
+    columns = template["columns"]
+    keys = [c["key"] for c in columns]
+    top_rows = template.get("top_rows", [])
+    footer_rows = template.get("footer_rows", [])
+    col_letters = {key: get_column_letter(i) for i, key in enumerate(keys, start=1)}
+    col_index = {key: i for i, key in enumerate(keys, start=1)}
+
+    # Колонки, которых нет в df (например, добавили в шаблон после создания df), — пустые.
+    df = df.reindex(columns=keys)
+    df = df.reset_index(drop=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (sheet_name or template.get("sheet_name") or "Лист1")[:31]
+
+    # Раскладка: top_rows, затем 2 строки шапки, затем данные, затем footer_rows.
+    header_row = len(top_rows) + 1
+    data_start = header_row + 2
+    data_end = data_start + len(df) - 1
+
+    # Верхние служебные строки (ячейки ввода).
+    top_cells: dict[str, str] = {}
+    for r, top in enumerate(top_rows, start=1):
+        value_idx = col_index[top["input_column"]]
+        _write_label_row(ws, r, top["label"], value_idx)
+        top_cells[top["id"]] = f"${get_column_letter(value_idx)}${r}"
+
+    _write_header(ws, columns, header_row)
+
+    # Данные.
+    ranges = _find_item_ranges(df, columns)
+    start_rows = {start for start, _ in ranges}
+
+    for idx in range(len(df)):
+        excel_row = data_start + idx
+        for col_i, col in enumerate(columns, start=1):
+            cell = ws.cell(row=excel_row, column=col_i)
+            if col["source"] == "formula":
+                # Формула — только в первой строке позиции, остальные ячейки объединены.
+                if idx in start_rows or not _is_item_level(col):
+                    cell.value = _render_formula(
+                        col["formula"], col_letters, top_cells, excel_row, data_start, data_end
+                    )
             else:
-                # Соседние строки той же позиции: поля уровня позиции не дублируем
-                # текстом, т.к. ячейки будут объединены в Excel.
-                blank_values = {col: None for col in _ITEM_LEVEL_COLUMNS}
-                rows.append({**blank_values, "characteristics": characteristic})
-        end_row = len(rows) - 1
-        if end_row > start_row:
-            merge_ranges.append((start_row, end_row))
+                cell.value = _to_excel_value(df.iloc[idx][col["key"]])
+            if col.get("number_format"):
+                cell.number_format = col["number_format"]
+            cell.alignment = Alignment(wrap_text=bool(col.get("wrap")), vertical="top")
 
-    df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
-    # Диапазоны строк для объединения ячеек сохраняем в атрибутах DataFrame,
-    # чтобы dataframe_to_excel_bytes мог их использовать без пересчёта.
-    df.attrs["merge_ranges"] = merge_ranges
-    # Строки-начала каждой позиции — именно в них dataframe_to_excel_bytes проставит
-    # формулу расчёта объёма (для продолжений той же позиции формула не нужна,
-    # т.к. ячейки будут объединены).
-    df.attrs["item_start_rows"] = item_start_rows
+    _merge_item_cells(ws, columns, ranges, data_start)
 
-    return df
+    # Нижние служебные строки.
+    for offset, footer in enumerate(footer_rows, start=1):
+        footer_row = data_end + offset
+        value_idx = col_index[footer["value_column"]]
+        _write_label_row(ws, footer_row, footer["label"], value_idx)
+        ws.cell(row=footer_row, column=value_idx).value = _render_formula(
+            footer["formula"], col_letters, top_cells, None, data_start, data_end
+        )
 
-
-def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Позиции закупки") -> bytes:
-    """
-    Сериализует DataFrame в xlsx и возвращает байты — удобно передавать
-    напрямую в st.download_button без временных файлов на диске.
-
-    Если у позиции несколько характеристик (несколько строк в df),
-    ячейки колонок уровня позиции (item_number, name, габариты, quantity)
-    объединяются по вертикали в одну — на основе df.attrs['merge_ranges'].
-    """
-    # Заголовки переводятся на русский только на выходе, в самом DataFrame
-    # (result_df) и остальном коде продолжают использоваться английские
-    # имена колонок — это упрощает работу с данными (data_editor, фильтры и т.д.).
-    export_df = df.rename(columns=COLUMN_LABELS)
-    merge_ranges = df.attrs.get("merge_ranges", [])
-    item_start_rows = df.attrs.get("item_start_rows", list(range(len(df))))
-
-    # Обратная карта 'внутреннее имя колонки' -> 'название группы' (для колонок
-    # вроде tz_price/tz_sum, объединяемых общим заголовком 'Вариант 1'/'Вариант 2').
-    col_to_group: dict[str, str] = {
-        col: group_name for group_name, cols in COLUMN_GROUPS.items() for col in cols
-    }
+    # Ширина колонок.
+    for col_i, col in enumerate(columns, start=1):
+        if col.get("width"):
+            width = col["width"]
+        else:
+            lengths = [len(str(col["label"]))]
+            for value in df[col["key"]].tolist():
+                if not _is_empty(value):
+                    lengths.append(max(len(line) for line in str(value).split("\n")))
+            width = min(max(lengths) + 2, 60)
+        ws.column_dimensions[get_column_letter(col_i)].width = width
 
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # startrow=2 (0-based) сдвигает заголовки колонок на строку 3 и оставляет
-        # строки 1-2 свободными: строка 1 — информационная строка с check_count
-        # (общее количество из ЕИС), строка 2 — общие заголовки групп
-        # ('Вариант 1' / 'Вариант 2').
-        export_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
-
-        worksheet = writer.sheets[sheet_name]
-
-        # Строка 2: для колонок без группы — объединяем с их заголовком в строке 3
-        # по вертикали (чтобы подпись не "провисала" рядом с пустой ячейкой сверху);
-        # для колонок в группе — пишем общее название группы и объединяем по горизонтали
-        # на ширину всех колонок этой группы, сама группа не трогает строку 3.
-        for idx, col in enumerate(df.columns, start=1):
-            if col not in col_to_group:
-                header_cell = worksheet.cell(row=3, column=idx)
-                worksheet.cell(row=2, column=idx).value = header_cell.value
-                header_cell.value = None
-                worksheet.merge_cells(start_row=2, end_row=3, start_column=idx, end_column=idx)
-
-        for group_name, group_cols in COLUMN_GROUPS.items():
-            group_indices = [i for i, col in enumerate(df.columns, start=1) if col in group_cols]
-            if not group_indices:
-                continue
-            start_col, end_col = min(group_indices), max(group_indices)
-            worksheet.cell(row=2, column=start_col).value = group_name
-            if end_col > start_col:
-                worksheet.merge_cells(start_row=2, end_row=2, start_column=start_col, end_column=end_col)
-
-        # Строка 1: информационная строка с ручным вводом 'check_count' — общее
-        # количество из ЕиС, с которым будет сравниваться сумма 'quantity' в итогах.
-        # Подпись прижата к правой границе и объединяет все колонки до 'quantity'
-        # включительно, сама ячейка check_count расположена ровно над колонкой 'quantity'.
-        quantity_col_idx = list(export_df.columns).index(COLUMN_LABELS["quantity"]) + 1
-        if quantity_col_idx > 1:
-            worksheet.merge_cells(start_row=1, end_row=1, start_column=1, end_column=quantity_col_idx - 1)
-        label_cell = worksheet.cell(row=1, column=1)
-        label_cell.value = "общее количество из ЕИС →"
-        label_cell.alignment = Alignment(horizontal="right")
-        label_cell.font = Font(bold=True)
-        check_count_cell = worksheet.cell(row=1, column=quantity_col_idx)
-        check_count_cell.alignment = Alignment(horizontal="center")
-        check_count_cell.font = Font(bold=True)
-        check_count_ref = f"{get_column_letter(quantity_col_idx)}1"
-
-        # Автоширина колонок для читаемости.
-        # Не используем df[col].astype(str).map(len) напрямую: при наличии
-        # None/NaN в колонке map может получить float('nan'), у которого
-        # нет len(), и упасть с TypeError. Считаем длину вручную,
-        # безопасно приводя каждое значение к строке.
-        def _safe_len(value) -> int:
-            if value is None:
-                return 0
-            try:
-                if pd.isna(value):
-                    return 0
-            except (TypeError, ValueError):
-                pass
-            return len(str(value))
-
-        for idx, col in enumerate(export_df.columns, start=1):
-            column_values = export_df[col].tolist()
-            max_content_len = max((_safe_len(v) for v in column_values), default=0)
-            max_len = max(max_content_len, len(str(col))) + 2
-            worksheet.column_dimensions[get_column_letter(idx)].width = min(max_len, 60)
-
-        # Колонку 'Эскиз' делаем чуть шире, т.к. в неё пользователь будет вручную
-        # вставлять изображение — узкая колонка по ширине заголовка для этого мала.
-        sketch_col_idx = list(export_df.columns).index(COLUMN_LABELS["sketch"]) + 1
-        worksheet.column_dimensions[get_column_letter(sketch_col_idx)].width = 20
-
-        # Перенос строк и выравнивание по верхнему краю для колонки характеристик,
-        # чтобы многострочный текст был читаемым.
-        characteristics_col_idx = list(export_df.columns).index(COLUMN_LABELS["characteristics"]) + 1
-        for row_idx in range(4, worksheet.max_row + 1):
-            worksheet.cell(row=row_idx, column=characteristics_col_idx).alignment = Alignment(
-                wrap_text=True, vertical="top"
-            )
-
-        # Формула расчёта объёма (м³) по габаритам и количеству из той же строки.
-        # Адреса ячеек берутся по фактическому индексу колонок, а не жёстко — если
-        # порядок колонок в config.EXPECTED_COLUMNS изменится, формула перестроится автоматически.
-        width_col = list(export_df.columns).index(COLUMN_LABELS["max_width_mm"]) + 1
-        depth_col = list(export_df.columns).index(COLUMN_LABELS["max_depth_mm"]) + 1
-        height_col = list(export_df.columns).index(COLUMN_LABELS["max_height_mm"]) + 1
-        quantity_col = list(export_df.columns).index(COLUMN_LABELS["quantity"]) + 1
-        volume_col = list(export_df.columns).index(COLUMN_LABELS["volume"]) + 1
-        tz_price_col = list(export_df.columns).index(COLUMN_LABELS["tz_price"]) + 1
-        tz_sum_col = list(export_df.columns).index(COLUMN_LABELS["tz_sum"]) + 1
-        sketch_price_col = list(export_df.columns).index(COLUMN_LABELS["sketch_price"]) + 1
-        sketch_sum_col = list(export_df.columns).index(COLUMN_LABELS["sketch_sum"]) + 1
-        fill_status_col = list(export_df.columns).index(COLUMN_LABELS["fill_status"]) + 1
-
-        width_letter = get_column_letter(width_col)
-        depth_letter = get_column_letter(depth_col)
-        height_letter = get_column_letter(height_col)
-        quantity_letter = get_column_letter(quantity_col)
-        volume_letter = get_column_letter(volume_col)
-        tz_price_letter = get_column_letter(tz_price_col)
-        sketch_price_letter = get_column_letter(sketch_price_col)
-        tz_sum_letter = get_column_letter(tz_sum_col)
-        sketch_sum_letter = get_column_letter(sketch_sum_col)
-
-        # +4, а не +3: строка 1 занята информационной строкой check_count,
-        # строка 2 — общими заголовками групп ('Вариант 1' / 'Вариант 2'),
-        # строка 3 — заголовками колонок (см. startrow=2 в to_excel выше),
-        # данные (0-based индекс df) начинаются со строки 4.
-        for start_row in item_start_rows:
-            excel_row = start_row + 4
-            w = f"{width_letter}{excel_row}"
-            d = f"{depth_letter}{excel_row}"
-            h = f"{height_letter}{excel_row}"
-            q = f"{quantity_letter}{excel_row}"
-            v = f"{volume_letter}{excel_row}"
-            tz_price_ref = f"{tz_price_letter}{excel_row}"
-            sketch_price_ref = f"{sketch_price_letter}{excel_row}"
-            # Excel всегда хранит в xlsx формулы с английскими именами функций
-            # (IF/AND/ISNUMBER), независимо от языка интерфейса: локализованные имена
-            # (ЕСЛИ/И/ЕЧИСЛО) openpyxl пишет буквально, Excel их не распознаёт
-            # и показывает #ИМЯ?. Excel сам отобразит IF/AND/ISNUMBER как
-            # ЕСЛИ/И/ЕЧИСЛО при русской локали интерфейса.
-            volume_formula = (
-                f'=IF(AND(ISNUMBER({w});ISNUMBER({d});ISNUMBER({h});ISNUMBER({q}));'
-                f'({w}/1000)*({d}/1000)*({h}/1000)*{q};"")'
-            )
-            worksheet.cell(row=excel_row, column=volume_col).value = volume_formula
-
-            # 'Сумма по ТЗ' / 'Сумма по эскизу' = 'Объём' * соответствующая цена,
-            # но только когда оба величины заданы числом — иначе ячейка суммы остаётся
-            # пустой, а не покажет 0 (объём или цена ещё не заполнены).
-            tz_sum_formula = (
-                f'=IF(AND(ISNUMBER({v});ISNUMBER({tz_price_ref}));{v}*{tz_price_ref};"")'
-            )
-            sketch_sum_formula = (
-                f'=IF(AND(ISNUMBER({v});ISNUMBER({sketch_price_ref}));{v}*{sketch_price_ref};"")'
-            )
-            worksheet.cell(row=excel_row, column=tz_sum_col).value = tz_sum_formula
-            worksheet.cell(row=excel_row, column=sketch_sum_col).value = sketch_sum_formula
-
-            # 'Заполнение' = "Заполнено", если обе суммы непусты, иначе "ПУСТО".
-            tz_sum_ref = f"{tz_sum_letter}{excel_row}"
-            sketch_sum_ref = f"{sketch_sum_letter}{excel_row}"
-            fill_status_formula = (
-                f'=IF(AND({tz_sum_ref}="";{sketch_sum_ref}="");"ПУСТО";"Заполнено")'
-            )
-            worksheet.cell(row=excel_row, column=fill_status_col).value = fill_status_formula
-
-        # Объединение ячеек для полей уровня позиции, когда у неё несколько
-        # строк-характеристик. +4, т.к. строки 1-3 — заголовки check_count/групп/колонок, а df использует 0-based индекс.
-        item_level_col_indices = [
-            idx for idx, col in enumerate(df.columns, start=1) if col in _ITEM_LEVEL_COLUMNS
-        ]
-        for start_row, end_row in merge_ranges:
-            excel_start = start_row + 4
-            excel_end = end_row + 4
-            for col_idx in item_level_col_indices:
-                worksheet.merge_cells(
-                    start_row=excel_start, end_row=excel_end,
-                    start_column=col_idx, end_column=col_idx,
-                )
-
-        # Итоговая строка под таблицей: сравнивает check_count (строка 1) с суммой
-        # всех 'quantity' в таблице. Подчёркивается сума только по строкам-началам
-        # каждой позиции (item_start_rows), т.к. у объединённых строк 'quantity' заполнено
-        # только в первой строке диапазона, остальные пусты.
-        totals_row = worksheet.max_row + 1
-        if quantity_col_idx > 1:
-            worksheet.merge_cells(
-                start_row=totals_row, end_row=totals_row,
-                start_column=1, end_column=quantity_col_idx - 1,
-            )
-        totals_label_cell = worksheet.cell(row=totals_row, column=1)
-        totals_label_cell.value = "проверка общего количества →"
-        totals_label_cell.alignment = Alignment(horizontal="right")
-        totals_label_cell.font = Font(bold=True)
-
-        quantity_letter = get_column_letter(quantity_col_idx)
-        quantity_sum_terms = "+".join(
-            f"{quantity_letter}{start_row + 4}" for start_row in item_start_rows
-        )
-        totals_result_cell = worksheet.cell(row=totals_row, column=quantity_col_idx)
-        if quantity_sum_terms:
-            totals_result_cell.value = (
-                f'=IF({check_count_ref}=({quantity_sum_terms});"Всё ОК";"Ошибка!")'
-            )
-        else:
-            totals_result_cell.value = f'=IF({check_count_ref}=0;"Всё ОК";"Ошибка!")'
-        totals_result_cell.alignment = Alignment(horizontal="center")
-        totals_result_cell.font = Font(bold=True)
-
-    buffer.seek(0)
+    wb.save(buffer)
     return buffer.getvalue()
