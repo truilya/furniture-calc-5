@@ -28,7 +28,14 @@ columns[] — список колонок слева направо:
 top_rows[]    — строки НАД шапкой: id, label, input_column
                 (под подписью объединяются ячейки до input_column,
                 сама ячейка ввода остаётся пустой)
-footer_rows[] — строки ПОД таблицей: label, value_column, formula
+footer_rows[] — строки ПОД таблицей (итоги). В одной строке может быть
+                несколько итоговых ячеек:
+                    label        — подпись строки
+                    label_column — (необяз.) колонка подписи, по умолчанию первая
+                    cells[]      — итоговые ячейки: column, formula,
+                                   number_format (необяз.)
+                Подпись объединяется от label_column до первой итоговой ячейки.
+                Старый формат value_column + formula читается как одна ячейка.
 
 Плейсхолдеры в формулах:
     {key}        — ячейка колонки key в текущей строке позиции
@@ -111,14 +118,36 @@ def validate_template(template: dict) -> None:
         top_ids.append(row["id"])
 
     for row in template.get("footer_rows", []):
-        if row.get("value_column") not in keys:
-            raise TemplateError(f"footer_rows: неизвестная value_column в {row}")
-        if not row.get("formula"):
-            raise TemplateError(f"footer_rows: у строки нет 'formula': {row}")
+        label_key = row.get("label_column", keys[0])
+        if label_key not in keys:
+            raise TemplateError(f"footer_rows: неизвестная label_column в {row}")
+        cells = _footer_cells(row)
+        if not cells:
+            raise TemplateError(f"footer_rows: у строки нет итоговых ячеек: {row}")
+        used: set[str] = set()
+        for cell in cells:
+            column = cell.get("column")
+            if column not in keys:
+                raise TemplateError(f"footer_rows: неизвестная колонка {column!r} в {row}")
+            if column in used:
+                raise TemplateError(f"footer_rows: колонка '{column}' повторяется в одной строке: {row}")
+            used.add(column)
+            if keys.index(column) <= keys.index(label_key):
+                raise TemplateError(
+                    f"footer_rows: итоговая ячейка '{column}' должна быть правее колонки подписи '{label_key}'."
+                )
+            if not cell.get("formula"):
+                raise TemplateError(f"footer_rows: у ячейки '{column}' нет 'formula': {row}")
+            for at, name, range_flag in _PLACEHOLDER_RE.findall(cell["formula"]):
+                if not at and not range_flag:
+                    raise TemplateError(
+                        f"footer_rows: в формуле итога {{{name}}} нужно писать как {{{name}:range}}: {cell['formula']}"
+                    )
 
     # Проверяем, что все плейсхолдеры формул ссылаются на существующее.
     formulas = [c["formula"] for c in columns if c.get("source") == "formula"]
-    formulas += [r["formula"] for r in template.get("footer_rows", [])]
+    for r in template.get("footer_rows", []):
+        formulas += [cell["formula"] for cell in _footer_cells(r)]
     for formula in formulas:
         for at, name, _range in _PLACEHOLDER_RE.findall(formula):
             if at and name not in top_ids:
@@ -346,6 +375,26 @@ def _write_label_row(ws, row: int, label: str, value_col_idx: int) -> None:
     value_cell.font = Font(bold=True)
 
 
+def _footer_cells(row: dict) -> list[dict]:
+    """Итоговые ячейки строки footer_rows; поддерживает старый формат value_column + formula."""
+    if "cells" in row:
+        cells = row["cells"]
+        return cells if isinstance(cells, list) else []
+    if row.get("value_column"):
+        return [{"column": row["value_column"], "formula": row.get("formula")}]
+    return []
+
+
+def _write_footer_label(ws, row: int, label: str, label_idx: int, first_value_idx: int) -> None:
+    """Подпись итоговой строки: объединяется от колонки подписи до первой итоговой ячейки."""
+    if first_value_idx - 1 > label_idx:
+        ws.merge_cells(start_row=row, end_row=row, start_column=label_idx, end_column=first_value_idx - 1)
+    label_cell = ws.cell(row=row, column=label_idx)
+    label_cell.value = label
+    label_cell.alignment = Alignment(horizontal="right")
+    label_cell.font = Font(bold=True)
+
+
 def dataframe_to_excel_bytes(
     df: pd.DataFrame,
     sheet_name: str | None = None,
@@ -412,11 +461,20 @@ def dataframe_to_excel_bytes(
     # Нижние служебные строки.
     for offset, footer in enumerate(footer_rows, start=1):
         footer_row = data_end + offset
-        value_idx = col_index[footer["value_column"]]
-        _write_label_row(ws, footer_row, footer["label"], value_idx)
-        ws.cell(row=footer_row, column=value_idx).value = _render_formula(
-            footer["formula"], col_letters, top_cells, None, data_start, data_end
-        )
+        cells = _footer_cells(footer)
+        label_idx = col_index[footer.get("label_column", keys[0])]
+        first_value_idx = min(col_index[c["column"]] for c in cells)
+        _write_footer_label(ws, footer_row, footer["label"], label_idx, first_value_idx)
+        for cell_def in cells:
+            value_idx = col_index[cell_def["column"]]
+            cell = ws.cell(row=footer_row, column=value_idx)
+            cell.value = _render_formula(
+                cell_def["formula"], col_letters, top_cells, None, data_start, data_end
+            )
+            cell.alignment = Alignment(horizontal="center")
+            cell.font = Font(bold=True)
+            if cell_def.get("number_format"):
+                cell.number_format = cell_def["number_format"]
 
     # Ширина колонок.
     for col_i, col in enumerate(columns, start=1):

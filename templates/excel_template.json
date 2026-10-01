@@ -48,8 +48,16 @@
   "footer_rows": [
     {
       "label": "проверка общего количества →",
-      "value_column": "quantity",
-      "formula": "=IF({@check_count}=SUM({quantity:range}),\"Всё ОК\",\"Ошибка!\")"
+      "cells": [
+        {
+          "column": "quantity",
+          "formula": "=IF({@check_count}=SUM({quantity:range}),\"Всё ОК\",\"Ошибка!\")"
+        },
+        {
+          "column": "fill_status",
+          "formula": "=IF(COUNTIF({fill_status:range},\"ПУСТО\")>0,\"Внимание!!!\",\"ОКЕЙ\")"
+        }
+      ]
     }
   ]
 }
