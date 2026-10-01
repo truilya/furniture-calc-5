@@ -58,6 +58,21 @@
           "formula": "=IF(COUNTIF({fill_status:range},\"ПУСТО\")>0,\"Внимание!!!\",\"ОКЕЙ\")"
         }
       ]
+    },
+    {
+      "label": "Итого без доставки",
+      "cells": [
+        {
+          "column": "tz_price",
+          "end_column": "tz_sum",
+          "formula": "=SUM({tz_sum:range})"
+        },
+        {
+          "column": "sketch_price",
+          "end_column": "sketch_sum",
+          "formula": "=SUM({sketch_sum:range})"
+        }
+      ]
     }
   ]
 }

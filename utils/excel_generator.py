@@ -33,7 +33,9 @@ footer_rows[] — строки ПОД таблицей (итоги). В одно
                     label        — подпись строки
                     label_column — (необяз.) колонка подписи, по умолчанию первая
                     cells[]      — итоговые ячейки: column, formula,
-                                   number_format (необяз.)
+                                   number_format (необяз.),
+                                   end_column (необяз., объединить ячейки
+                                   от column до end_column включительно)
                 Подпись объединяется от label_column до первой итоговой ячейки.
                 Старый формат value_column + formula читается как одна ячейка.
 
@@ -125,6 +127,7 @@ def validate_template(template: dict) -> None:
         if not cells:
             raise TemplateError(f"footer_rows: у строки нет итоговых ячеек: {row}")
         used: set[str] = set()
+        occupied: set[int] = set()
         for cell in cells:
             column = cell.get("column")
             if column not in keys:
@@ -132,6 +135,17 @@ def validate_template(template: dict) -> None:
             if column in used:
                 raise TemplateError(f"footer_rows: колонка '{column}' повторяется в одной строке: {row}")
             used.add(column)
+            start_i = keys.index(column)
+            end_key = cell.get("end_column", column)
+            if end_key not in keys:
+                raise TemplateError(f"footer_rows: неизвестная end_column {end_key!r} в {row}")
+            end_i = keys.index(end_key)
+            if end_i < start_i:
+                raise TemplateError(f"footer_rows: end_column '{end_key}' левее column '{column}'.")
+            span = set(range(start_i, end_i + 1))
+            if span & occupied:
+                raise TemplateError(f"footer_rows: объединённые ячейки пересекаются в строке: {row}")
+            occupied |= span
             if keys.index(column) <= keys.index(label_key):
                 raise TemplateError(
                     f"footer_rows: итоговая ячейка '{column}' должна быть правее колонки подписи '{label_key}'."
@@ -471,6 +485,12 @@ def dataframe_to_excel_bytes(
             cell.value = _render_formula(
                 cell_def["formula"], col_letters, top_cells, None, data_start, data_end
             )
+            end_idx = col_index[cell_def.get("end_column", cell_def["column"])]
+            if end_idx > value_idx:
+                ws.merge_cells(
+                    start_row=footer_row, end_row=footer_row,
+                    start_column=value_idx, end_column=end_idx,
+                )
             cell.alignment = Alignment(horizontal="center")
             cell.font = Font(bold=True)
             if cell_def.get("number_format"):
