@@ -63,11 +63,13 @@
       "label": "Итого без доставки",
       "cells": [
         {
+          "id": "total_tz",
           "column": "tz_price",
           "end_column": "tz_sum",
           "formula": "=SUM({tz_sum:range})"
         },
         {
+          "id": "total_sketch",
           "column": "sketch_price",
           "end_column": "sketch_sum",
           "formula": "=SUM({sketch_sum:range})"

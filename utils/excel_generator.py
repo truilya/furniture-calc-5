@@ -33,6 +33,7 @@ footer_rows[] — строки ПОД таблицей (итоги). В одно
                     label        — подпись строки
                     label_column — (необяз.) колонка подписи, по умолчанию первая
                     cells[]      — итоговые ячейки: column, formula,
+                                   id (необяз., имя ячейки для {@id} в формулах),
                                    number_format (необяз.),
                                    end_column (необяз., объединить ячейки
                                    от column до end_column включительно)
@@ -42,7 +43,8 @@ footer_rows[] — строки ПОД таблицей (итоги). В одно
 Плейсхолдеры в формулах:
     {key}        — ячейка колонки key в текущей строке позиции
     {key:range}  — диапазон данных колонки key (первая—последняя строка)
-    {@id}        — абсолютный адрес ячейки ввода из top_rows
+    {@id}        — абсолютный адрес ячейки ввода из top_rows или итоговой
+                   ячейки footer_rows (cells[].id); циклы проверяет Excel
 
 Формулы пишутся с английскими именами функций и запятой между
 аргументами: так они хранятся в xlsx, Excel сам покажет их в локали
@@ -135,6 +137,15 @@ def validate_template(template: dict) -> None:
             if column in used:
                 raise TemplateError(f"footer_rows: колонка '{column}' повторяется в одной строке: {row}")
             used.add(column)
+            cell_id = cell.get("id")
+            if cell_id is not None:
+                if not isinstance(cell_id, str) or not re.fullmatch(r"[A-Za-z0-9_]+", cell_id):
+                    raise TemplateError(
+                        f"footer_rows: id {cell_id!r} должен состоять из латиницы, цифр и '_': {row}"
+                    )
+                if cell_id in top_ids:
+                    raise TemplateError(f"Повторяющийся id ячейки: {cell_id}")
+                top_ids.append(cell_id)
             start_i = keys.index(column)
             end_key = cell.get("end_column", column)
             if end_key not in keys:
@@ -447,6 +458,14 @@ def dataframe_to_excel_bytes(
         value_idx = col_index[top["input_column"]]
         _write_label_row(ws, r, top["label"], value_idx)
         top_cells[top["id"]] = f"${get_column_letter(value_idx)}${r}"
+
+    # Адреса итоговых ячеек с id (заранее, чтобы на них можно было ссылаться
+    # из любых формул, в том числе из строк выше). Циклы проверяет Excel.
+    for offset, footer in enumerate(footer_rows, start=1):
+        for cell_def in _footer_cells(footer):
+            if cell_def.get("id"):
+                letter = get_column_letter(col_index[cell_def["column"]])
+                top_cells[cell_def["id"]] = f"${letter}${data_end + offset}"
 
     _write_header(ws, columns, header_row)
 
