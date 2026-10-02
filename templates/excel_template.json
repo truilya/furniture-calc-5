@@ -63,13 +63,13 @@
       "label": "Итого без доставки",
       "cells": [
         {
-          "id": "total_tz",
+          "id": "total_tz_without_delivery",
           "column": "tz_price",
           "end_column": "tz_sum",
           "formula": "=SUM({tz_sum:range})"
         },
         {
-          "id": "total_sketch",
+          "id": "total_sketch_without_delivery",
           "column": "sketch_price",
           "end_column": "sketch_sum",
           "formula": "=SUM({sketch_sum:range})"
@@ -90,6 +90,60 @@
           "column": "tz_price",
           "end_column": "sketch_sum",
           "formula": "={@cubic_meter_delivery_cost}*SUM({volume:range})"
+        }
+      ]
+    },
+    {
+      "label": "Грузчики",
+      "cells": [
+        {
+          "id": "movers_cost",
+          "column": "tz_price",
+          "end_column": "sketch_sum",
+          "input": true
+        }
+      ]
+    },
+    {
+      "label": "Сборка",
+      "cells": [
+        {
+          "id": "assembly_cost",
+          "column": "tz_price",
+          "end_column": "sketch_sum",
+          "input": true
+        }
+      ]
+    },
+    {
+      "label": "Итого",
+      "cells": [
+        {
+          "id": "total_tz",
+          "column": "tz_price",
+          "end_column": "tz_sum",
+          "formula": "={@total_tz_without_delivery} + {@volume_delivery_cost} + {@movers_cost} + {@assembly_cost}"
+        },
+        {
+          "id": "total_sketch",
+          "column": "sketch_price",
+          "end_column": "sketch_sum",
+          "formula": "={@total_sketch_without_delivery} + {@volume_delivery_cost} + {@movers_cost} + {@assembly_cost}"
+        }
+      ]
+    },
+    {
+      "label": "Итого Алексей",
+      "cells": [
+        {
+          "column": "tz_price",
+          "end_column": "tz_sum",
+          "input": true
+        },
+        {
+          "column": "sketch_price",
+          "end_column": "sketch_sum",
+          "input": true
         }
       ]
     }
