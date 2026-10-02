@@ -75,6 +75,23 @@
           "formula": "=SUM({sketch_sum:range})"
         }
       ]
+    },
+    {
+      "label": "Доставка м3",
+      "cells": [
+        {
+          "id": "cubic_meter_delivery_cost",
+          "column": "volume",
+          "end_column": "volume",
+          "input": true
+        },
+        {
+          "id": "volume_delivery_cost",
+          "column": "tz_price",
+          "end_column": "sketch_sum",
+          "formula": "={@cubic_meter_delivery_cost}*SUM({volume:range})"
+        }
+      ]
     }
   ]
 }

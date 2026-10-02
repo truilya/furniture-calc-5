@@ -34,6 +34,8 @@ footer_rows[] — строки ПОД таблицей (итоги). В одно
                     label_column — (необяз.) колонка подписи, по умолчанию первая
                     cells[]      — итоговые ячейки: column, formula,
                                    id (необяз., имя ячейки для {@id} в формулах),
+                                   input (необяз., true — ячейка ручного ввода
+                                   без формулы; value — значение по умолчанию),
                                    number_format (необяз.),
                                    end_column (необяз., объединить ячейки
                                    от column до end_column включительно)
@@ -161,8 +163,14 @@ def validate_template(template: dict) -> None:
                 raise TemplateError(
                     f"footer_rows: итоговая ячейка '{column}' должна быть правее колонки подписи '{label_key}'."
                 )
+            if cell.get("input"):
+                if cell.get("formula"):
+                    raise TemplateError(
+                        f"footer_rows: ячейка '{column}' с input=true не может иметь 'formula': {row}"
+                    )
+                continue
             if not cell.get("formula"):
-                raise TemplateError(f"footer_rows: у ячейки '{column}' нет 'formula': {row}")
+                raise TemplateError(f"footer_rows: у ячейки '{column}' нет 'formula' (или input=true): {row}")
             for at, name, range_flag in _PLACEHOLDER_RE.findall(cell["formula"]):
                 if not at and not range_flag:
                     raise TemplateError(
@@ -172,7 +180,7 @@ def validate_template(template: dict) -> None:
     # Проверяем, что все плейсхолдеры формул ссылаются на существующее.
     formulas = [c["formula"] for c in columns if c.get("source") == "formula"]
     for r in template.get("footer_rows", []):
-        formulas += [cell["formula"] for cell in _footer_cells(r)]
+        formulas += [cell["formula"] for cell in _footer_cells(r) if cell.get("formula")]
     for formula in formulas:
         for at, name, _range in _PLACEHOLDER_RE.findall(formula):
             if at and name not in top_ids:
@@ -501,9 +509,13 @@ def dataframe_to_excel_bytes(
         for cell_def in cells:
             value_idx = col_index[cell_def["column"]]
             cell = ws.cell(row=footer_row, column=value_idx)
-            cell.value = _render_formula(
-                cell_def["formula"], col_letters, top_cells, None, data_start, data_end
-            )
+            if cell_def.get("input"):
+                # Ячейка ручного ввода: формулы нет, значение по умолчанию (необяз.).
+                cell.value = cell_def.get("value")
+            else:
+                cell.value = _render_formula(
+                    cell_def["formula"], col_letters, top_cells, None, data_start, data_end
+                )
             end_idx = col_index[cell_def.get("end_column", cell_def["column"])]
             if end_idx > value_idx:
                 ws.merge_cells(
