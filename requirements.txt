@@ -1,10 +1,10 @@
 streamlit>=1.38
-pandas>=2.2
-openpyxl>=3.1
-pypdf>=4.2
-python-docx>=1.1
-openai>=1.30
-mammoth>=1.12.0
+pandas>=3.0.6
+openpyxl>=3.1.5
+pypdf>=6.19.0
+python-docx>=1.2.0
+openai>=3.25.0
+mammoth>=1.13.0
 
 #.streamlit==1.41.1
 #openai==1.59.7
