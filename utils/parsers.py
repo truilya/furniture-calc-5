@@ -7,8 +7,8 @@ from __future__ import annotations
 import io
 
 import streamlit as st
+import mammoth
 from pypdf import PdfReader
-from docx import Document
 
 
 class ParsingError(Exception):
@@ -22,14 +22,14 @@ def _read_pdf(file_bytes: bytes) -> str:
 
 
 def _read_docx(file_bytes: bytes) -> str:
-    document = Document(io.BytesIO(file_bytes))
-    parts = [p.text for p in document.paragraphs if p.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            row_text = " | ".join(cell.text.strip() for cell in row.cells)
-            if row_text.strip(" |"):
-                parts.append(row_text)
-    return "\n".join(parts).strip()
+    """Извлекает текст и таблицы из DOCX, сохраняя порядок и структуру Markdown."""
+    try:
+        file_obj = io.BytesIO(file_bytes)
+        # Конвертируем DOCX в Markdown формат
+        result = mammoth.convert_to_markdown(file_obj)
+        return result.value.strip()
+    except Exception as exc:
+        raise ParsingError(f"Ошибка парсинга DOCX через Mammoth: {exc}") from exc
 
 
 @st.cache_data(show_spinner=False)
