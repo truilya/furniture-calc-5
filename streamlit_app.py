@@ -153,6 +153,9 @@ def render_result() -> None:
         with st.expander("Показать извлечённый текст ТЗ"):
             st.text(st.session_state["extracted_text"])
 
+        with st.expander("Показать возвращенный JSON"):
+            st.text(st.session_state["result_df"])
+
 
 # ---------------------------------------------------------------------------
 # Точка входа
