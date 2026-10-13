@@ -145,4 +145,4 @@ for _col in EXCEL_TEMPLATE["columns"]:
 REQUEST_TIMEOUT = 120
 
 # Максимальное количество токенов в ответе модели
-MAX_OUTPUT_TOKENS = 8192
+MAX_OUTPUT_TOKENS = 12000 # 8192
