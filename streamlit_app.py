@@ -154,7 +154,7 @@ def render_result() -> None:
             st.text(st.session_state["extracted_text"])
 
         with st.expander("Показать возвращенный JSON"):
-            st.text(st.session_state["result_df"])
+            st.text(st.session_state["ai_raw_response"])
 
 
 # ---------------------------------------------------------------------------
