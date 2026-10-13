@@ -4,8 +4,8 @@ openpyxl>=3.1
 pypdf>=4.2
 python-docx>=1.1
 openai>=1.30
-#mammoth>=1.12.0
-tabulate>=0.9.0
+mammoth>=1.12.0
+
 
 #.streamlit==1.41.1
 #openai==1.59.7
