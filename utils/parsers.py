@@ -26,7 +26,8 @@ def _read_docx(file_bytes: bytes) -> str:
     try:
         file_obj = io.BytesIO(file_bytes)
         # Конвертируем DOCX в Markdown формат
-        result = mammoth.convert_to_markdown(file_obj)
+        #result = mammoth.convert_to_markdown(file_obj)
+        result = mammoth.convert_to_html(file_obj)
         return result.value.strip()
     except Exception as exc:
         raise ParsingError(f"Ошибка парсинга DOCX через Mammoth: {exc}") from exc
