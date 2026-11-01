@@ -28,7 +28,7 @@
       "label": "Сумма по ТЗ",
       "source": "formula",
       "group": "Вариант 1",
-      "formula": "=IF(AND(ISNUMBER({volume}),ISNUMBER({tz_price})),{volume}*{tz_price},\"\")"
+      "formula": "=IF(AND(ISNUMBER({quantity}),ISNUMBER({tz_price})),{quantity}*{tz_price},\"\")"
     },
     {"key": "sketch_price", "label": "Цена по эскизу", "source": "manual", "group": "Вариант 2"},
     {
@@ -36,7 +36,7 @@
       "label": "Сумма по эскизу",
       "source": "formula",
       "group": "Вариант 2",
-      "formula": "=IF(AND(ISNUMBER({volume}),ISNUMBER({sketch_price})),{volume}*{sketch_price},\"\")"
+      "formula": "=IF(AND(ISNUMBER({quantity}),ISNUMBER({sketch_price})),{quantity}*{sketch_price},\"\")"
     },
     {
       "key": "fill_status",
