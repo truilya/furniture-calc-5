@@ -1,120 +1,145 @@
 # utils/parsers.py
 """
-Модуль отвечает ТОЛЬКО за извлечение текста из загруженных файлов.
-Никакой бизнес-логики (обращения к ИИ, генерации Excel) — единственная ответственность.
+Модуль отвечает за извлечение текста из загруженных файлов.
+Поддерживает постраничное чтение для агентской архитектуры, чтобы не перегружать контекст ИИ.
 """
 from __future__ import annotations
 import io
+import re
 
 import streamlit as st
 import mammoth
 from pypdf import PdfReader
-from bs4 import BeautifulSoup  # Используем для очистки вложенных таблиц
+from bs4 import BeautifulSoup
 
 
 class ParsingError(Exception):
     """Ошибка извлечения текста из файла."""
 
 
-def _flatten_html_to_markdown(html_content: str) -> str:
+def _flatten_html_to_markdown_chunks(html_content: str) -> list[str]:
     """
     Принимает тяжелый HTML от mammoth со вложенными таблицами
-    и преобразует его в плоский, читаемый для ИИ Markdown-текст.
+    и преобразует его в список текстовых блоков (строк таблицы), имитируя страницы.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
-    markdown_lines = []
+    chunks = []
 
-    # Находим главную (внешнюю) таблицу объекта закупки
     main_table = soup.find('table')
     if not main_table:
-        # Если таблиц нет вообще, возвращаем просто очищенный от тегов текст
-        return soup.get_text(separator="\n").strip()
+        # Если таблиц нет, делим просто текст по крупным абзацам
+        paragraphs = soup.get_text(separator="\n").strip().split("\n\n")
+        return [p.strip() for p in paragraphs if p.strip()]
 
     rows = main_table.find_all('tr', recursive=False)
 
-    for row in rows:
+    current_chunk = []
+    # Группируем строки (например, по 3 строки основной таблицы в один блок), чтобы не плодить слишком мелкие куски
+    for idx, row in enumerate(rows):
         cells = row.find_all(['td', 'th'], recursive=False)
         row_data = []
 
         for cell in cells:
-            # Проверяем, есть ли ВНУТРИ текущей ячейки вложенная таблица с характеристиками
             nested_table = cell.find('table')
-
             if nested_table:
-                # Если нашли вложенную таблицу, парсим её строки отдельно
                 nested_lines = []
                 nested_rows = nested_table.find_all('tr')
                 for n_row in nested_rows:
                     n_cells = [c.get_text(strip=True) for c in n_row.find_all(['td', 'th'])]
-                    # Фильтруем пустые ячейки
                     n_cells = [c for c in n_cells if c.strip()]
                     if n_cells:
-                        # Объединяем наименование характеристики, значение и инструкцию через тире
                         nested_lines.append(" — ".join(n_cells))
-
-                # Соединяем все характеристики позиции через перенос строки
                 row_data.append("\n" + "\n".join(nested_lines) + "\n")
             else:
-                # Если вложенной таблицы нет, просто берем очищенный текст ячейки
                 text = cell.get_text(strip=True)
                 if text:
                     row_data.append(text)
 
         if row_data:
-            # Склеиваем колонки основной строки через стандартный пайп (|)
-            markdown_lines.append(" | ".join(row_data))
-            markdown_lines.append("-" * 20)  # Визуальный разделитель строк для ИИ
+            current_chunk.append(" | ".join(row_data))
+            current_chunk.append("-" * 20)
 
-    return "\n".join(markdown_lines).strip()
+        # Каждые 3 строки основной спецификации формируют "страницу" для ИИ
+        if (idx + 1) % 3 == 0 and current_chunk:
+            chunks.append("\n".join(current_chunk).strip())
+            current_chunk = []
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk).strip())
+
+    return chunks
 
 
-def _read_pdf(file_bytes: bytes) -> str:
+def _read_pdf_pages(file_bytes: bytes) -> list[str]:
+    """Извлекает текст из PDF поэлементно (список страниц)."""
     reader = PdfReader(io.BytesIO(file_bytes))
-    pages_text = [(page.extract_text() or "") for page in reader.pages]
-    return "\n".join(pages_text).strip()
+    return [(page.extract_text() or "").strip() for page in reader.pages]
 
 
-def _read_docx(file_bytes: bytes) -> str:
-    """Извлекает текст и таблицы из DOCX, сохраняя порядок и структуру Markdown."""
+def _read_docx_pages(file_bytes: bytes) -> list[str]:
+    """Конвертирует DOCX в HTML и режет на логические чанки-страницы."""
     try:
         file_obj = io.BytesIO(file_bytes)
-        # Конвертируем DOCX в Markdown формат
-        #result = mammoth.convert_to_markdown(file_obj)
         result = mammoth.convert_to_html(file_obj)
-        #return result.value.strip()
-
         raw_html = result.value.strip()
-
-        # 2. Выпрямляем вложенные таблицы HTML в плоский Markdown-текст
-        flat_markdown = _flatten_html_to_markdown(raw_html)
-        return flat_markdown
+        return _flatten_html_to_markdown_chunks(raw_html)
     except Exception as exc:
         raise ParsingError(f"Ошибка парсинга DOCX через Mammoth: {exc}") from exc
 
 
-
 @st.cache_data(show_spinner=False)
-def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
+def get_file_metadata_and_pages(file_bytes: bytes, file_name: str) -> dict:
     """
-    Кэшируется по хешу байтов файла: при rerun (например, смена модели
-    в селекторе) повторный парсинг не выполняется.
+    Главная агентская функция. Вместо одной огромной строки возвращает словарь с метаданными
+    и списком страниц/чанков. Кэшируется Streamlit.
+
+    Returns:
+        dict: {
+            "total_pages": int,
+            "pages": list[str],
+            "summary": str  # Первые 2 страницы для ознакомления ИИ
+        }
     """
     suffix = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
     try:
         if suffix == "pdf":
-            text = _read_pdf(file_bytes)
+            pages = _read_pdf_pages(file_bytes)
         elif suffix == "docx":
-            text = _read_docx(file_bytes)
+            pages = _read_docx_pages(file_bytes)
         else:
             raise ParsingError(f"Неподдерживаемый формат: .{suffix}")
     except ParsingError:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise ParsingError(f"Не удалось прочитать '{file_name}': {exc}") from exc
 
-    if not text:
+    # Фильтруем абсолютно пустые страницы
+    pages = [p for p in pages if p.strip()]
+
+    if not pages:
         raise ParsingError(
             f"Из файла '{file_name}' не удалось извлечь текст "
             "(возможно, это скан без текстового слоя)."
         )
-    return text
+
+    # Формируем краткую выжимку (первые 2 страницы), чтобы агент понял контекст документа
+    summary_limit = min(2, len(pages))
+    summary_text = f"Файл: {file_name}. Всего логических страниц/секций: {len(pages)}.\n\n"
+    summary_text += "--- НАЧАЛО ДОКУМЕНТА (ПЕРВЫЕ СТРАНИЦЫ) ---\n"
+    summary_text += "\n\n=== Новая секция ===\n\n".join(pages[:summary_limit])
+    summary_text += "\n\n--- КОНЕЦ ВВОДНОЙ ЧАСТИ ---"
+
+    return {
+        "total_pages": len(pages),
+        "pages": pages,
+        "summary": summary_text
+    }
+
+
+def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
+    """
+    Сохраняем обратную совместимость со старым кодом.
+    Если где-то в streamlit_app.py всё еще запрашивается сплошной текст.
+    """
+    data = get_file_metadata_and_pages(file_bytes, file_name)
+    return "\n\n=== Новая секция/Страница ===\n\n".join(data["pages"])
