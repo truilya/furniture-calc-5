@@ -9,7 +9,7 @@ from __future__ import annotations
 import streamlit as st
 
 from config import AVAILABLE_MODELS, DEFAULT_MODEL_LABEL, DEFAULT_SYSTEM_PROMPT
-from utils.parsers import extract_text_from_file, ParsingError
+from utils.parsers import get_file_metadata_and_pages, ParsingError
 from utils.ai_client import analyze_tz_with_ai, AIRequestError
 from utils.excel_generator import (
     parse_ai_response_to_df,
@@ -28,7 +28,7 @@ def init_session_state() -> None:
     defaults = {
         "uploaded_file_bytes": None,
         "uploaded_file_name": None,
-        "extracted_text": None,
+        "tz_data": None,                       # Хранит структурированный dict вместо плоской строки extracted_text
         "selected_model": AVAILABLE_MODELS[DEFAULT_MODEL_LABEL],
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "processing_status": "idle",  # idle | parsing | analyzing | done | error
@@ -43,7 +43,7 @@ def init_session_state() -> None:
 
 def reset_pipeline_state() -> None:
     """Сброс результатов при загрузке нового файла — старые данные не должны 'протекать'."""
-    st.session_state["extracted_text"] = None
+    st.session_state["tz_data"] = None
     st.session_state["ai_raw_response"] = None
     st.session_state["result_df"] = None
     st.session_state["excel_bytes"] = None
@@ -90,22 +90,24 @@ def run_pipeline(uploaded_file) -> None:
         st.session_state["uploaded_file_bytes"] = file_bytes
         st.session_state["uploaded_file_name"] = file_name
 
-    # Шаг 1: извлечение текста (кэшируется по содержимому файла)
+    # Шаг 1: извлечение текста и разбивка на страницы/секции
     st.session_state["processing_status"] = "parsing"
     try:
-        with st.spinner("Извлекаю текст из файла..."):
-            st.session_state["extracted_text"] = extract_text_from_file(file_bytes, file_name)
+        with st.spinner("Извлекаю текст и формирую структуру документа..."):
+            # Вызываем новую агентскую функцию парсинга вместо extract_text_from_file
+            st.session_state["tz_data"] = get_file_metadata_and_pages(file_bytes, file_name)
     except ParsingError as exc:
         st.session_state["processing_status"] = "error"
         st.session_state["error_message"] = str(exc)
         return
 
-    # Шаг 2: анализ ИИ
+    # Шаг 2: многошаговый анализ ИИ (локализация + сбор порциями)
     st.session_state["processing_status"] = "analyzing"
     try:
-        with st.spinner(f"Анализирую ТЗ моделью «{st.session_state['selected_model']}»..."):
+        with st.spinner(f"Запуск ИИ-агента с моделью «{st.session_state['selected_model']}»..."):
+            # Передаем словарь tz_data вместо плоского текста
             raw_response = analyze_tz_with_ai(
-                tz_text=st.session_state["extracted_text"],
+                tz_data=st.session_state["tz_data"],
                 system_prompt=st.session_state["system_prompt"],
                 model_name=st.session_state["selected_model"],
             )
@@ -151,7 +153,10 @@ def render_result() -> None:
         )
 
         with st.expander("Показать извлечённый текст ТЗ"):
-            st.text(st.session_state["extracted_text"])
+            if st.session_state["tz_data"] and "pages" in st.session_state["tz_data"]:
+                # Восстанавливаем сплошной текст из списка страниц для UI
+                full_text = "\n\n=== Новая секция/Страница ===\n\n".join(st.session_state["tz_data"]["pages"])
+                st.text(full_text)
 
         with st.expander("Показать возвращенный JSON"):
             st.text(st.session_state["ai_raw_response"])
