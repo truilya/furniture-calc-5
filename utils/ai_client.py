@@ -122,9 +122,9 @@ def _detect_specification_pages_pipeline(pages: list[str], model_name: str) -> l
     return sorted(list(set(valid_indices)))
 
 
-def _build_overlapping_chunks(indices: list[int], chunk_size: int = 8, overlap: int = 1) -> list[list[int]]:
+def _build_overlapping_chunks(indices: list[int], chunk_size: int = 5, overlap: int = 2) -> list[list[int]]:
     """
-    Разбивает список индексов страниц на крупные блоки с перекрытием (overlap),
+    Разбивает список индексов страниц на блоки с перекрытием (overlap),
     чтобы позиции, разорванные на границе чанков, целиком попадали хотя бы в один блок.
     """
     if len(indices) <= chunk_size:
@@ -167,7 +167,7 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
     """
     Полностью автономный многошаговый ИИ-агент.
     Находит спецификации, склеивает разорванные между страницами позиции
-    и собирает данные крупными окнами с перекрытием.
+    и собирает данные окнами с перекрытием.
     """
     if isinstance(tz_data, str):
         tz_data = {
@@ -190,9 +190,10 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
         human_pages = [idx + 1 for idx in target_indices]
         st.info(f"🎯 Агент сфокусировался на спецификациях (страницы: {human_pages})")
 
-    # Шаг 2: Формируем крупные блоки по 8 страниц с перекрытием в 1 страницу
-    page_chunks = _build_overlapping_chunks(target_indices, chunk_size=8, overlap=1)
+    # Шаг 2: Формируем блоки по 5 страниц с перекрытием в 2 страницы
+    page_chunks = _build_overlapping_chunks(target_indices, chunk_size=5, overlap=2)
     raw_collected_items = []
+    last_extracted_name = ""
 
     client = _get_client()
 
@@ -204,18 +205,18 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
 
         boundary_rules = (
             "ПРАВИЛО СКЛЕЙКИ РАЗОРВАННЫХ ТАБЛИЦ:\n"
-            "1. В PDF-документах одна позиция таблицы часто разрывается между соседними страницами "
-            "(на одной странице заголовок и начало характеристик, на следующей — конец характеристик и остаток количества). "
-            "Обязательно объединяй такие разорванные части в одну целую позицию и суммируй её количество!\n"
+            "1. В PDF/DOCX-документах одна позиция таблицы часто разрывается между соседними страницами. "
+            "Обязательно объединяй разорванные части в одну целую позицию и суммируй её количество!\n"
         )
         if not is_first:
             boundary_rules += (
-                "2. Если в самом начале фрагмента идет обрезанный «хвост» позиции без её номера и названия — "
-                "ИГНОРИРУЙ этот хвост, он уже учтен в предыдущем блоке.\n"
+                f"2. В предыдущем блоке последней полностью извлеченной позицией была: «{last_extracted_name}». "
+                "Если в самом начале текущего фрагмента идет она или её обрезанный хвост без номера и названия — ИГНОРИРУЙ их. "
+                "Начинай извлечение строго со СЛЕДУЮЩЕЙ новой позиции с номером и названием.\n"
             )
         if not is_last:
             boundary_rules += (
-                "3. Если последняя позиция в самом конце фрагмента оборвана (не хватает характеристик или количества) — "
+                "3. Если самая последняя позиция в самом конце текущего фрагмента оборвана (не дошла до конца характеристик или количества) — "
                 "НЕ включай её в ответ, она целиком войдет в следующий блок.\n"
             )
 
@@ -223,9 +224,11 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
             f"{system_prompt}\n\n"
             f"Сейчас ты обрабатываешь блок {chunk_idx + 1} из {len(page_chunks)}.\n"
             f"{boundary_rules}\n"
-            "Извлеки ВСЕ полные позиции закупки из этого блока без пропусков и обобщений. "
-            "Не считай позиции дубликатами, если у них отличается цвет, тип секции (прямая/угловая), размеры или количество. "
-            "Верни строго JSON с ключом 'items'."
+            "КРИТИЧЕСКИ ВАЖНО ДЛЯ ВСЕХ ПОЗИЦИЙ БЛОКА:\n"
+            "- Для КАЖДОЙ позиции (включая позиции в середине и конце блока) извлекай абсолютно ВСЕ строки характеристик из таблицы без сокращений, "
+            "включая повторяющиеся поля (например, «Вид товара: Секция диванная»), материалы, цвет и размеры.\n"
+            "- Не пропускай одинаковые характеристики у последующих позиций.\n"
+            "- Верни строго JSON с ключом 'items'."
         )
 
         correction_messages = []
@@ -242,7 +245,7 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
                     response = client.chat.completions.create(
                         model=model_name,
                         max_tokens=MAX_OUTPUT_TOKENS,
-                        temperature=0.1,
+                        temperature=0.0,
                         messages=messages_to_send,
                     )
             except (APITimeoutError, APIError, Exception) as exc:
@@ -255,7 +258,10 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
 
             if is_valid:
                 chunk_data = json.loads(validation_result)
-                raw_collected_items.extend(chunk_data.get("items", []))
+                items_in_chunk = chunk_data.get("items", [])
+                if items_in_chunk:
+                    last_extracted_name = items_in_chunk[-1].get("name", "")
+                raw_collected_items.extend(items_in_chunk)
                 chunk_success = True
                 break
 
