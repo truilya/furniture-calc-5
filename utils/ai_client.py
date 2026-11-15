@@ -2,7 +2,7 @@
 """
 Обёртка над API GPTunneL (эндпоинт совместим с OpenAI Chat Completions).
 Автономный ИИ-агент с двухэтапной фильтрацией страниц, склейкой разорванных позиций
-и обработкой крупным окном с перекрытием (Sliding Window with Overlap).
+окном с перекрытием и умным слиянием по оригинальному номеру позиции из ТЗ.
 """
 from __future__ import annotations
 
@@ -63,8 +63,7 @@ def _verify_pages_with_ai(candidate_pages_meta: str, model_name: str) -> list[in
         "ВНИМАНИЕ: Строго исключи страницы, которые содержат посторонние таблицы, такие как:\n"
         "- Адресные перечни / Адреса доставки / Распределение по адресам (Приложение 2 и т.п.)\n"
         "- Графики и сроки поставки\n"
-        "- Перечни нормативных актов (ГОСТы, СНиПы)\n"
-        "- Разделы с общими требованиями, гарантийными обязательствами и дополнительными условиями\n\n"
+        "- Перечни нормативных актов (ГОСТы, СНиПы)\n\n"
         "Выведи ответ строго в формате JSON (массив номеров страниц, которые нужно обработать):\n"
         "{\n  \"target_pages\": [8, 9, 10]\n}\n"
         "Не пиши никаких объяснений до или после JSON."
@@ -106,7 +105,7 @@ def _detect_specification_pages_pipeline(pages: list[str], model_name: str) -> l
 
     meta_lines = []
     for idx in candidate_indices:
-        preview = pages[idx][:300].replace("\n", " ").strip()
+        preview = pages[idx][:250].replace("\n", " ").strip()
         meta_lines.append(f"Страница {idx + 1}: {preview}...")
 
     candidate_pages_meta = "\n".join(meta_lines)
@@ -123,10 +122,10 @@ def _detect_specification_pages_pipeline(pages: list[str], model_name: str) -> l
     return sorted(list(set(valid_indices)))
 
 
-def _build_overlapping_chunks(indices: list[int], chunk_size: int = 25, overlap: int = 3) -> list[list[int]]:
+def _build_overlapping_chunks(indices: list[int], chunk_size: int = 5, overlap: int = 2) -> list[list[int]]:
     """
-    Разбивает список индексов страниц на крупные блоки с перекрытием (overlap).
-    При chunk_size=25 большинство спецификаций обрабатываются единым блоком без разрывов.
+    Разбивает список индексов страниц на компактные блоки по 5 страниц с перекрытием в 2 страницы,
+    чтобы модель не упиралась в лимит выходных токенов и не пропускала характеристики.
     """
     if len(indices) <= chunk_size:
         return [indices]
@@ -141,41 +140,74 @@ def _build_overlapping_chunks(indices: list[int], chunk_size: int = 25, overlap:
     return chunks
 
 
-def _deduplicate_items(items: list[dict]) -> list[dict]:
+def _item_completeness_score(item: dict) -> tuple[int, int, int]:
     """
-    Умная дедупликация позиций на стыках перекрытия (если документ > 25 страниц).
-    Сравнивает нормализованное наименование + габариты + количество.
-    Если найден дубль на стыке чанков, сохраняет версию с более полным списком характеристик.
+    Оценивает полноту извлечённой позиции при слиянии дублей с границ перекрытия:
+    приоритет у версии, где заполнено количество, больше характеристик и заполнены габариты.
     """
-    unique_items: list[dict] = []
-    seen_index: dict[tuple, int] = {}
+    has_qty = 1 if item.get("quantity") is not None else 0
+    chars_count = len(item.get("characteristics") or [])
+    dims_count = sum(
+        1 for k in ("max_width_mm", "max_depth_mm", "max_height_mm") if item.get(k) is not None
+    )
+    return (has_qty, chars_count, dims_count)
+
+
+def _merge_and_deduplicate_items(items: list[dict]) -> list[dict]:
+    """
+    Объединяет позиции из перекрывающихся блоков по оригинальному номеру в ТЗ (source_number).
+    Если позиция попала на границу чанков дважды (в одном обрезана, в другом полная),
+    выбирает самую полную версию.
+    """
+    by_source_num: dict[int, dict] = {}
+    fallback_items: list[dict] = []
+    seen_fallback = set()
 
     for item in items:
-        signature = (
-            str(item.get("name", "")).strip().lower(),
-            item.get("max_width_mm"),
-            item.get("max_depth_mm"),
-            item.get("max_height_mm"),
-            item.get("quantity"),
-        )
-        if signature not in seen_index:
-            seen_index[signature] = len(unique_items)
-            unique_items.append(item)
-        else:
-            existing_pos = seen_index[signature]
-            existing_chars = unique_items[existing_pos].get("characteristics", [])
-            current_chars = item.get("characteristics", [])
-            if len(current_chars) > len(existing_chars):
-                unique_items[existing_pos] = item
+        raw_src_num = item.get("source_number")
+        src_num = None
+        if raw_src_num is not None:
+            try:
+                src_num = int(re.sub(r"\D", "", str(raw_src_num)))
+            except ValueError:
+                src_num = None
 
-    return unique_items
+        if src_num is not None and src_num > 0:
+            if src_num not in by_source_num:
+                by_source_num[src_num] = item
+            else:
+                existing = by_source_num[src_num]
+                if _item_completeness_score(item) > _item_completeness_score(existing):
+                    by_source_num[src_num] = item
+        else:
+            chars_key = tuple(sorted(str(c).strip().lower() for c in item.get("characteristics", [])))
+            sig = (
+                str(item.get("name", "")).strip().lower(),
+                item.get("max_width_mm"),
+                item.get("max_depth_mm"),
+                item.get("max_height_mm"),
+                item.get("quantity"),
+                chars_key,
+            )
+            if sig not in seen_fallback:
+                seen_fallback.add(sig)
+                fallback_items.append(item)
+
+    sorted_numbered = [by_source_num[k] for k in sorted(by_source_num.keys())]
+    merged = sorted_numbered + fallback_items
+
+    for idx, item in enumerate(merged, start=1):
+        item.pop("source_number", None)
+        item["item_number"] = idx
+
+    return merged
 
 
 def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str, max_retries: int = 2) -> str:
     """
     Полностью автономный многошаговый ИИ-агент.
     Находит спецификации, склеивает разорванные между страницами позиции
-    и собирает данные крупным окном (до 25 страниц за проход).
+    компактными окнами с перекрытием и объединяет результаты по номеру позиции в ТЗ.
     """
     if isinstance(tz_data, str):
         tz_data = {
@@ -198,8 +230,8 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
         human_pages = [idx + 1 for idx in target_indices]
         st.info(f"🎯 Агент сфокусировался на спецификациях (страницы: {human_pages})")
 
-    # Шаг 2: Формируем крупные блоки по 25 страниц с перекрытием в 3 страницы
-    page_chunks = _build_overlapping_chunks(target_indices, chunk_size=25, overlap=3)
+    # Шаг 2: Компактные блоки по 5 страниц с перекрытием в 2 страницы
+    page_chunks = _build_overlapping_chunks(target_indices, chunk_size=5, overlap=2)
     raw_collected_items = []
 
     client = _get_client()
@@ -211,32 +243,30 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
         is_last = (chunk_idx == len(page_chunks) - 1)
 
         boundary_rules = (
-            "ПРАВИЛА РАБОТЫ С ТАБЛИЦЕЙ СПЕЦИФИКАЦИИ:\n"
-            "1. Новая позиция начинается ТОЛЬКО там, где есть её явный порядковый номер и наименование товара "
-            "(в отдельном столбце или в объединяющей строке-заголовке над характеристиками).\n"
-            "2. Если при переходе на новую страницу сразу идут строки с характеристиками без номера и названия нового товара — "
-            "это продолжение предыдущей позиции, объедини их в одну целую позицию.\n"
-            "3. Игнорируй итоговые строки («Итого», «Всего наименований»), примечания в конце таблицы и разделы с условиями доставки/гарантии.\n"
+            "ПРАВИЛО СКЛЕЙКИ РАЗОРВАННЫХ ПОЗИЦИЙ:\n"
+            "1. Новая позиция начинается ТОЛЬКО там, где есть её порядковый номер и наименование товара (в ячейке столбца или в объединяющей строке-заголовке). "
+            "Если на новой странице сразу идут характеристики без нового номера и названия позиции — объедини их с предыдущей позицией.\n"
         )
         if not is_first:
             boundary_rules += (
-                "4. Если в самом начале фрагмента идет обрезанный хвост позиции без номера и названия — "
-                "ИГНОРИРУЙ его, эта позиция уже полностью учтена в предыдущем блоке.\n"
+                "2. Если в самом начале фрагмента идет обрезанный «хвост» характеристик без номера и наименования позиции — "
+                "ИГНОРИРУЙ этот хвост, он уже учтён в предыдущем блоке.\n"
             )
         if not is_last:
             boundary_rules += (
-                "5. Если самая последняя позиция в самом конце фрагмента оборвана на середине характеристик — "
-                "НЕ включай её в ответ, она целиком войдет в следующий блок.\n"
+                "3. Если последняя позиция в конце фрагмента оборвана (не дошла до конца характеристик или количества) — "
+                "можешь либо пропустить её, либо извлечь то, что есть, указав её точный source_number из ТЗ (в следующем блоке она будет собрана целиком).\n"
             )
 
         chunk_system_prompt = (
             f"{system_prompt}\n\n"
             f"Сейчас ты обрабатываешь блок {chunk_idx + 1} из {len(page_chunks)}.\n"
             f"{boundary_rules}\n"
-            "КРИТИЧЕСКИ ВАЖНО:\n"
-            "- Извлекай ВСЕ характеристики для КАЖДОЙ позиции без пропусков и сокращений, даже если строки повторяются "
-            "от позиции к позиции (например, «Вид товара: Секция диванная»).\n"
-            "- Верни строго чистый JSON с ключом 'items'."
+            "ВАЖНО:\n"
+            "- Обязательно заполняй поле 'source_number' точным номером позиции из ТЗ (1, 2, 3...).\n"
+            "- Для КАЖДОЙ позиции извлекай ВСЕ технические характеристики без сокращений (включая 'Вид товара' и др.), "
+            "но НЕ включай в характеристики общие условия доставки, разгрузки, гарантии и нормативные акты из конца документа.\n"
+            "- Верни строго JSON с ключом 'items'."
         )
 
         correction_messages = []
@@ -283,13 +313,7 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
         if not chunk_success:
             raise AIRequestError(f"Агент не смог разобрать блок текста {chunk_idx + 1} из-за ошибок формата.")
 
-    # Шаг 3: Дедупликация (актуальна только если блоков > 1) и сквозная перенумерация
-    if len(page_chunks) > 1:
-        final_items = _deduplicate_items(raw_collected_items)
-    else:
-        final_items = raw_collected_items
-
-    for idx, item in enumerate(final_items, start=1):
-        item["item_number"] = idx
+    # Шаг 3: Умное слияние позиций по оригинальному номеру в ТЗ (source_number) и сквозная перенумерация
+    final_items = _merge_and_deduplicate_items(raw_collected_items)
 
     return json.dumps({"items": final_items}, ensure_ascii=False)
