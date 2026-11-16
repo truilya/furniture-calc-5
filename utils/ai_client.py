@@ -97,7 +97,7 @@ def _detect_specification_pages_pipeline(pages: list[str], model_name: str) -> l
     """
     candidate_indices = []
     for idx, page_text in enumerate(pages):
-        if page_text.count("|") > 2 or "характеристики" in page_text.lower():
+        if page_text.count("|") > 2 or "<table" in page_text.lower() or "характеристики" in page_text.lower():
             candidate_indices.append(idx)
 
     if not candidate_indices:
