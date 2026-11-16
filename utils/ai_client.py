@@ -1,8 +1,11 @@
 # utils/ai_client.py
 """
 Обёртка над API GPTunneL (эндпоинт совместим с OpenAI Chat Completions).
-Автономный ИИ-агент с двухэтапной фильтрацией страниц, склейкой разорванных позиций
-окном с перекрытием и умным слиянием по оригинальному номеру позиции из ТЗ.
+Универсальный двухпроходный ИИ-агент:
+1. Локализует страницы спецификации (отсекая адреса, графики и ГОСТы).
+2. Проход 1 (Skeleton): строит эталонный реестр всех позиций закупки (номер, название, страницы).
+3. Проход 2 (Batch Extraction): детально извлекает характеристики, габариты и итоговое количество
+   группами по 4 конкретные позиции из эталонного списка, исключая разрывы на стыках страниц.
 """
 from __future__ import annotations
 
@@ -59,9 +62,9 @@ def _verify_pages_with_ai(candidate_pages_meta: str, model_name: str) -> list[in
     verification_prompt = (
         "Ты — аналитик тендерной документации. Перед тобой список страниц документа, на которых обнаружены таблицы.\n"
         "Твоя задача — определить, на каких именно страницах находится 'Перечень объектов закупки' / 'Спецификация товаров' "
-        "(таблица, где перечислены наименования закупаемых товаров, мебели или оборудования, их технические характеристики и общее количество).\n\n"
-        "ВНИМАНИЕ: Строго исключи страницы, которые содержат посторонние таблицы, такие как:\n"
-        "- Адресные перечни / Адреса доставки / Распределение по адресам (Приложение 2 и т.п.)\n"
+        "(таблица, где перечислены наименования закупаемых товаров, мебели или оборудования, их технические характеристики и количество).\n\n"
+        "ВНИМАНИЕ: Строго исключи страницы, которые содержат ТОЛЬКО посторонние таблицы, такие как:\n"
+        "- Отдельные адресные перечни / Адреса доставки (Приложение 2 и т.п.)\n"
         "- Графики и сроки поставки\n"
         "- Перечни нормативных актов (ГОСТы, СНиПы)\n\n"
         "Выведи ответ строго в формате JSON (массив номеров страниц, которые нужно обработать):\n"
@@ -72,7 +75,7 @@ def _verify_pages_with_ai(candidate_pages_meta: str, model_name: str) -> list[in
     try:
         response = client.chat.completions.create(
             model=model_name,
-            max_tokens=400,
+            max_tokens=500,
             temperature=0.0,
             messages=[
                 {"role": "system", "content": verification_prompt},
@@ -105,7 +108,7 @@ def _detect_specification_pages_pipeline(pages: list[str], model_name: str) -> l
 
     meta_lines = []
     for idx in candidate_indices:
-        preview = pages[idx][:250].replace("\n", " ").strip()
+        preview = pages[idx][:300].replace("\n", " ").strip()
         meta_lines.append(f"Страница {idx + 1}: {preview}...")
 
     candidate_pages_meta = "\n".join(meta_lines)
@@ -122,92 +125,96 @@ def _detect_specification_pages_pipeline(pages: list[str], model_name: str) -> l
     return sorted(list(set(valid_indices)))
 
 
-def _build_overlapping_chunks(indices: list[int], chunk_size: int = 5, overlap: int = 2) -> list[list[int]]:
+def _extract_specification_skeleton(all_pages: list[str], target_indices: list[int], model_name: str) -> list[dict]:
     """
-    Разбивает список индексов страниц на компактные блоки по 5 страниц с перекрытием в 2 страницы,
-    чтобы модель не упиралась в лимит выходных токенов и не пропускала характеристики.
+    Проход 1 (Skeleton): просматривает всю спецификацию целиком и строит точный эталонный
+    реестр всех позиций закупки (номер, наименование, стартовая и конечная страницы).
     """
-    if len(indices) <= chunk_size:
-        return [indices]
+    client = _get_client()
 
-    chunks = []
-    step = max(1, chunk_size - overlap)
-    for i in range(0, len(indices), step):
-        chunk = indices[i:i + chunk_size]
-        chunks.append(chunk)
-        if i + chunk_size >= len(indices):
-            break
-    return chunks
+    tagged_pages = []
+    for idx in target_indices:
+        tagged_pages.append(f"=== СТРАНИЦА {idx + 1} ===\n{all_pages[idx]}")
+    full_spec_text = "\n\n".join(tagged_pages)
 
-
-def _item_completeness_score(item: dict) -> tuple[int, int, int]:
-    """
-    Оценивает полноту извлечённой позиции при слиянии дублей с границ перекрытия:
-    приоритет у версии, где заполнено количество, больше характеристик и заполнены габариты.
-    """
-    has_qty = 1 if item.get("quantity") is not None else 0
-    chars_count = len(item.get("characteristics") or [])
-    dims_count = sum(
-        1 for k in ("max_width_mm", "max_depth_mm", "max_height_mm") if item.get(k) is not None
+    skeleton_prompt = (
+        "Ты — эксперт по анализу тендерных спецификаций. Перед тобой полный текст спецификации с маркерами страниц.\n"
+        "Твоя задача — составить ТОЧНЫЙ эталонный реестр всех самостоятельных позиций закупки в порядке их следования в документе.\n\n"
+        "Правила:\n"
+        "1. Новая позиция начинается там, где есть её порядковый номер и наименование товара (в первом столбце таблицы или в объединяющей строке-заголовке).\n"
+        "2. Одна позиция часто занимает несколько страниц (заголовок на одной странице, характеристики и количество — на следующих). НЕ разбивай одну позицию на несколько!\n"
+        "3. Не включай в список итоговые строки ('Итого', 'Всего') и разделы с условиями поставки/гарантии.\n"
+        "4. Для каждой позиции укажи:\n"
+        "   - 'source_number': оригинальный порядковый номер позиции в ТЗ (целое число: 1, 2, 3...)\n"
+        "   - 'name': точное наименование объекта закупки из ТЗ\n"
+        "   - 'start_page': номер страницы (из маркера === СТРАНИЦА N ===), где начинается эта позиция\n"
+        "   - 'end_page': номер страницы, где заканчиваются её характеристики и указано количество\n\n"
+        "Верни строго JSON без пояснений:\n"
+        "{\n  \"skeleton\": [\n    {\"source_number\": 1, \"name\": \"Наименование\", \"start_page\": 8, \"end_page\": 9}\n  ]\n}"
     )
-    return (has_qty, chars_count, dims_count)
 
-
-def _merge_and_deduplicate_items(items: list[dict]) -> list[dict]:
-    """
-    Объединяет позиции из перекрывающихся блоков по оригинальному номеру в ТЗ (source_number).
-    Если позиция попала на границу чанков дважды (в одном обрезана, в другом полная),
-    выбирает самую полную версию.
-    """
-    by_source_num: dict[int, dict] = {}
-    fallback_items: list[dict] = []
-    seen_fallback = set()
-
-    for item in items:
-        raw_src_num = item.get("source_number")
-        src_num = None
-        if raw_src_num is not None:
-            try:
-                src_num = int(re.sub(r"\D", "", str(raw_src_num)))
-            except ValueError:
-                src_num = None
-
-        if src_num is not None and src_num > 0:
-            if src_num not in by_source_num:
-                by_source_num[src_num] = item
-            else:
-                existing = by_source_num[src_num]
-                if _item_completeness_score(item) > _item_completeness_score(existing):
-                    by_source_num[src_num] = item
-        else:
-            chars_key = tuple(sorted(str(c).strip().lower() for c in item.get("characteristics", [])))
-            sig = (
-                str(item.get("name", "")).strip().lower(),
-                item.get("max_width_mm"),
-                item.get("max_depth_mm"),
-                item.get("max_height_mm"),
-                item.get("quantity"),
-                chars_key,
+    try:
+        with st.spinner("Шаг 1/2: Агент строит эталонный реестр всех позиций ТЗ..."):
+            response = client.chat.completions.create(
+                model=model_name,
+                max_tokens=2048,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": skeleton_prompt},
+                    {"role": "user", "content": full_spec_text},
+                ],
             )
-            if sig not in seen_fallback:
-                seen_fallback.add(sig)
-                fallback_items.append(item)
+        content = response.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            skeleton = data.get("skeleton", [])
+            if isinstance(skeleton, list) and skeleton:
+                return skeleton
+    except Exception:
+        pass
+    return []
 
-    sorted_numbered = [by_source_num[k] for k in sorted(by_source_num.keys())]
-    merged = sorted_numbered + fallback_items
 
-    for idx, item in enumerate(merged, start=1):
-        item.pop("source_number", None)
-        item["item_number"] = idx
+def _slice_pages_for_batch(
+    all_pages: list[str],
+    target_indices: list[int],
+    batch_items: list[dict],
+) -> str:
+    """
+    Выбирает диапазон страниц для конкретного батча позиций с запасом ±1 страница от спецификации,
+    чтобы гарантированно захватить начало первой позиции батча и количество последней позиции батча.
+    """
+    min_page = min(int(it.get("start_page", 1)) for it in batch_items)
+    max_page = max(int(it.get("end_page", len(all_pages))) for it in batch_items)
 
-    return merged
+    # Переводим в 0-based индексы
+    start_idx = max(0, min_page - 1)
+    end_idx = min(len(all_pages) - 1, max_page - 1)
+
+    # Расширяем на 1 страницу спецификации в обе стороны для страховки на стыках
+    pos_in_target_start = 0
+    pos_in_target_end = len(target_indices) - 1
+    for pos, t_idx in enumerate(target_indices):
+        if t_idx <= start_idx:
+            pos_in_target_start = pos
+        if t_idx >= end_idx:
+            pos_in_target_end = pos
+            break
+
+    safe_start_pos = max(0, pos_in_target_start - 1)
+    safe_end_pos = min(len(target_indices) - 1, pos_in_target_end + 1)
+
+    selected_indices = target_indices[safe_start_pos : safe_end_pos + 1]
+    return "\n\n".join([f"=== СТРАНИЦА {idx + 1} ===\n{all_pages[idx]}" for idx in selected_indices])
 
 
 def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str, max_retries: int = 2) -> str:
     """
-    Полностью автономный многошаговый ИИ-агент.
-    Находит спецификации, склеивает разорванные между страницами позиции
-    компактными окнами с перекрытием и объединяет результаты по номеру позиции в ТЗ.
+    Универсальный двухпроходный ИИ-агент:
+    1. Находит страницы спецификации.
+    2. Строит эталонный реестр всех позиций (Skeleton).
+    3. Извлекает полные данные группами по 4 позиции из эталонного списка.
     """
     if isinstance(tz_data, str):
         tz_data = {
@@ -220,7 +227,7 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
     if not all_pages:
         raise AIRequestError("Ошибка: Входящий документ не содержит текста для анализа.")
 
-    # Шаг 1: Двухэтапная локализация страниц спецификации
+    # Шаг 1: Локализация страниц спецификации
     target_indices = _detect_specification_pages_pipeline(all_pages, model_name)
 
     if not target_indices:
@@ -230,56 +237,70 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
         human_pages = [idx + 1 for idx in target_indices]
         st.info(f"🎯 Агент сфокусировался на спецификациях (страницы: {human_pages})")
 
-    # Шаг 2: Компактные блоки по 5 страниц с перекрытием в 2 страницы
-    page_chunks = _build_overlapping_chunks(target_indices, chunk_size=5, overlap=2)
-    raw_collected_items = []
-
     client = _get_client()
 
-    for chunk_idx, chunk in enumerate(page_chunks):
-        chunk_text = "\n".join([all_pages[idx] for idx in chunk])
+    # Шаг 2: Построение эталонного реестра позиций (Проход 1)
+    skeleton = _extract_specification_skeleton(all_pages, target_indices, model_name)
 
-        is_first = (chunk_idx == 0)
-        is_last = (chunk_idx == len(page_chunks) - 1)
+    if skeleton:
+        st.info(f"📋 В спецификации обнаружено позиций: {len(skeleton)}. Начинаю детальный сбор...")
+        batch_size = 4
+        batches = [skeleton[i : i + batch_size] for i in range(0, len(skeleton), batch_size)]
+    else:
+        # Резервный режим, если скелет не построился: делим по 5 страниц
+        step = 4
+        page_groups = [target_indices[i : i + 5] for i in range(0, len(target_indices), step)]
+        batches = [[{"page_indices": grp}] for grp in page_groups]
 
-        boundary_rules = (
-            "ПРАВИЛО СКЛЕЙКИ РАЗОРВАННЫХ ПОЗИЦИЙ:\n"
-            "1. Новая позиция начинается ТОЛЬКО там, где есть её порядковый номер и наименование товара (в ячейке столбца или в объединяющей строке-заголовке). "
-            "Если на новой странице сразу идут характеристики без нового номера и названия позиции — объедини их с предыдущей позицией.\n"
-        )
-        if not is_first:
-            boundary_rules += (
-                "2. Если в самом начале фрагмента идет обрезанный «хвост» характеристик без номера и наименования позиции — "
-                "ИГНОРИРУЙ этот хвост, он уже учтён в предыдущем блоке.\n"
+    collected_items: list[dict] = []
+
+    # Шаг 3: Детальное извлечение батчами (Проход 2)
+    for b_idx, batch in enumerate(batches):
+        if "page_indices" in batch[0]:
+            # Резервный режим без скелета
+            grp = batch[0]["page_indices"]
+            context_text = "\n\n".join([f"=== СТРАНИЦА {idx + 1} ===\n{all_pages[idx]}" for idx in grp])
+            target_instruction = (
+                "Извлеки все полные позиции закупки из представленного фрагмента. "
+                "Обязательно склеивай позиции, разорванные между соседними страницами."
             )
-        if not is_last:
-            boundary_rules += (
-                "3. Если последняя позиция в конце фрагмента оборвана (не дошла до конца характеристик или количества) — "
-                "можешь либо пропустить её, либо извлечь то, что есть, указав её точный source_number из ТЗ (в следующем блоке она будет собрана целиком).\n"
+        else:
+            # Основной режим по эталонному списку из 4 позиций
+            context_text = _slice_pages_for_batch(all_pages, target_indices, batch)
+            targets_list_str = "\n".join(
+                [f"- Позиция №{it.get('source_number')}: «{it.get('name')}» (ориентировочно стр. {it.get('start_page')}–{it.get('end_page')})" for it in batch]
+            )
+            target_instruction = (
+                f"Твоя задача — извлечь полные данные СТРОГО для следующих {len(batch)} позиций из спецификации:\n"
+                f"{targets_list_str}\n\n"
+                "КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА ДЛЯ ЭТОГО БЛОКА:\n"
+                "1. Верни в массиве 'items' РОВНО эти позиции (в том же количестве и порядке). Другие позиции из текста игнорируй.\n"
+                "2. Одна позиция часто растянута на 2–3 страницы: заголовок и начало характеристик на одной странице, "
+                "продолжение характеристик на второй, а итоговое количество (или разбивка количества по адресам/строкам) — на следующей странице. "
+                "Обязательно проследи каждую позицию до самого конца её блока в таблице, чтобы собрать ВСЕ характеристики и ТОЧНОЕ количество!\n"
+                "3. Если количество для позиции указано несколькими цифрами (например, по адресам или партиям внутри этой позиции) — обязательно сложи их в одно итоговое число 'quantity'.\n"
+                "4. Для КАЖДОЙ позиции извлекай абсолютно ВСЕ технические характеристики без сокращений (включая 'Вид товара' и др.), даже если они повторяются от позиции к позиции.\n"
+                "5. НЕ включай в характеристики общие условия доставки, разгрузки, гарантии и нормативные акты."
             )
 
-        chunk_system_prompt = (
+        batch_system_prompt = (
             f"{system_prompt}\n\n"
-            f"Сейчас ты обрабатываешь блок {chunk_idx + 1} из {len(page_chunks)}.\n"
-            f"{boundary_rules}\n"
-            "ВАЖНО:\n"
-            "- Обязательно заполняй поле 'source_number' точным номером позиции из ТЗ (1, 2, 3...).\n"
-            "- Для КАЖДОЙ позиции извлекай ВСЕ технические характеристики без сокращений (включая 'Вид товара' и др.), "
-            "но НЕ включай в характеристики общие условия доставки, разгрузки, гарантии и нормативные акты из конца документа.\n"
-            "- Верни строго JSON с ключом 'items'."
+            f"Сейчас ты обрабатываешь группу {b_idx + 1} из {len(batches)}.\n"
+            f"{target_instruction}\n"
+            "Верни строго чистый JSON с ключом 'items'."
         )
 
         correction_messages = []
-        chunk_success = False
+        batch_success = False
 
         for attempt in range(1, max_retries + 1):
             messages_to_send = [
-                {"role": "system", "content": chunk_system_prompt},
-                {"role": "user", "content": chunk_text},
+                {"role": "system", "content": batch_system_prompt},
+                {"role": "user", "content": context_text},
             ] + correction_messages
 
             try:
-                with st.spinner(f"Извлечение данных (Блок {chunk_idx + 1}/{len(page_chunks)}, Попытка {attempt})..."):
+                with st.spinner(f"Извлечение данных (Группа {b_idx + 1}/{len(batches)}, Попытка {attempt})..."):
                     response = client.chat.completions.create(
                         model=model_name,
                         max_tokens=MAX_OUTPUT_TOKENS,
@@ -288,21 +309,22 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
                     )
             except (APITimeoutError, APIError, Exception) as exc:
                 if attempt == max_retries:
-                    raise AIRequestError(f"Сбой сети на блоке {chunk_idx + 1}: {exc}") from exc
+                    raise AIRequestError(f"Сбой сети на группе {b_idx + 1}: {exc}") from exc
                 continue
 
             content = response.choices[0].message.content or ""
             is_valid, validation_result = _validate_json_structure(content)
 
             if is_valid:
-                chunk_data = json.loads(validation_result)
-                raw_collected_items.extend(chunk_data.get("items", []))
-                chunk_success = True
+                batch_data = json.loads(validation_result)
+                items_out = batch_data.get("items", [])
+                collected_items.extend(items_out)
+                batch_success = True
                 break
 
             if attempt < max_retries:
                 feedback_message = (
-                    f"Ошибка формата JSON на текущем блоке:\n{validation_result}\n\n"
+                    f"Ошибка формата JSON на текущей группе:\n{validation_result}\n\n"
                     "Исправь ошибку структуры и выведи строго чистый JSON-объект."
                 )
                 correction_messages = [
@@ -310,10 +332,12 @@ def analyze_tz_with_ai(tz_data: str | dict, system_prompt: str, model_name: str,
                     {"role": "user", "content": feedback_message},
                 ]
 
-        if not chunk_success:
-            raise AIRequestError(f"Агент не смог разобрать блок текста {chunk_idx + 1} из-за ошибок формата.")
+        if not batch_success:
+            raise AIRequestError(f"Агент не смог разобрать группу {b_idx + 1} из-за ошибок формата.")
 
-    # Шаг 3: Умное слияние позиций по оригинальному номеру в ТЗ (source_number) и сквозная перенумерация
-    final_items = _merge_and_deduplicate_items(raw_collected_items)
+    # Сквозная перенумерация итогового списка
+    for idx, item in enumerate(collected_items, start=1):
+        item.pop("source_number", None)
+        item["item_number"] = idx
 
-    return json.dumps({"items": final_items}, ensure_ascii=False)
+    return json.dumps({"items": collected_items}, ensure_ascii=False)
